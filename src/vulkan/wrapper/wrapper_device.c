@@ -20,7 +20,6 @@
 
 const struct vk_device_extension_table wrapper_device_extensions =
 {
-   /* Wrapper-owned WSI extensions: handled by the wrapper, not forwarded. */
    .KHR_swapchain = true,
    .EXT_swapchain_maintenance1 = true,
    .KHR_swapchain_mutable_format = true,
@@ -30,21 +29,56 @@ const struct vk_device_extension_table wrapper_device_extensions =
    .KHR_present_id = true,
    .KHR_present_wait = true,
    .KHR_incremental_present = true,
-
-   /* Extensions the wrapper itself must enable in the underlying driver. */
+   /*
+    * Skip-table entries: these are handled by wrapper WSI or appended by
+    * wrapper_append_required_extensions() when the base driver supports them.
+    * This table does not itself advertise extensions to applications.
+    */
+   .KHR_driver_properties = true,
+   .KHR_device_group = true,
+   .KHR_zero_initialize_workgroup_memory = true,
+   .EXT_multisampled_render_to_single_sampled = true,
+   /*
+    * Plain pass-through extensions that wrapper_append_required_extensions()
+    * requests explicitly, by name, whenever the driver supports them. Listed
+    * here so the app-request filter does not add them a second time.
+    */
+   .KHR_external_fence = true,
+   .KHR_external_semaphore = true,
    .KHR_external_memory = true,
+   .KHR_external_fence_fd = true,
+   .KHR_external_semaphore_fd = true,
    .KHR_external_memory_fd = true,
-   .EXT_external_memory_dma_buf = true,
-   .ANDROID_external_memory_android_hardware_buffer = true,
-   .KHR_buffer_device_address = true,
-   .KHR_vulkan_memory_model = true,
+   .KHR_dedicated_allocation = true,
+   .EXT_queue_family_foreign = true,
+   .KHR_maintenance1 = true,
+   .KHR_maintenance2 = true,
+   .KHR_image_format_list = true,
    .KHR_timeline_semaphore = true,
-   /* App requests are skipped here because wrapper_CreateDevice appends it. */
+   .KHR_get_memory_requirements2 = true,
+   .KHR_vulkan_memory_model = true,
+   .KHR_bind_memory2 = true,
+   .KHR_copy_commands2 = true,
+   .EXT_external_memory_host = true,
+   .EXT_external_memory_dma_buf = true,
+   .EXT_external_memory_acquire_unmodified = true,
+   .EXT_image_drm_format_modifier = false,
+   .ANDROID_external_memory_android_hardware_buffer = true,
+   /*
+    * VK_EXT_device_fault is appended explicitly in wrapper_CreateDevice()
+    * based on WRAPPER_DEVICE_FAULT, never via an app request -- skip it here
+    * too so the blanket sweep can't add it a second time.
+    */
    .EXT_device_fault = true,
 };
 
-/* Only these extensions are implemented by the wrapper's WSI layer and may
- * be advertised without the underlying Mali driver exposing them. */
+/*
+ * Extensions the wrapper really implements itself (WSI layer). These are the
+ * ONLY device extensions that are advertised without the Mali driver listing
+ * them. Every other extension is advertised if and only if the driver reports
+ * it -- no fake extensions. (wrapper_device_extensions above is only the
+ * "added to the driver's enable list from exactly one place" skip table.)
+ */
 const struct vk_device_extension_table wrapper_wsi_extensions =
 {
    .KHR_swapchain = true,
@@ -57,7 +91,6 @@ const struct vk_device_extension_table wrapper_wsi_extensions =
    .KHR_present_wait = true,
    .KHR_incremental_present = true,
 };
-
 
 /*
  * Extensions device creation *requires* unconditionally from the underlying
@@ -219,34 +252,57 @@ wrapper_filter_enabled_extensions(const struct wrapper_device *device,
 
 }
 
-
 static inline void
 wrapper_append_required_extensions(const struct vk_device *device,
                                   uint32_t *count,
-                                  const char **exts)
-{
+                                  const char **exts) {
+   /* Only request what the system driver really lists: forcing a name it does
+    * not know makes vkCreateDevice fail with VK_ERROR_EXTENSION_NOT_PRESENT. */
    const struct wrapper_physical_device *pdevice =
       (const struct wrapper_physical_device *)device->physical;
 
-   /* These are used by the wrapper's AHardwareBuffer / dma-buf memory path.
-    * Do not force unrelated driver extensions: applications can still request
-    * any supported pass-through extension through wrapper_filter_enabled_extensions(). */
 #define REQUIRED_EXTENSION(name) \
-   do { \
-      if (device->physical->supported_extensions.name && \
-          pdevice->base_supported_extensions.name) \
-         exts[(*count)++] = "VK_" #name; \
-   } while (0)
-
+   if (device->physical->supported_extensions.name && \
+       pdevice->base_supported_extensions.name) { \
+      exts[(*count)++] = "VK_" #name; \
+   }
+   
+   REQUIRED_EXTENSION(KHR_external_fence);
+   REQUIRED_EXTENSION(KHR_external_semaphore);
    REQUIRED_EXTENSION(KHR_external_memory);
+   REQUIRED_EXTENSION(KHR_external_fence_fd);
+   REQUIRED_EXTENSION(KHR_external_semaphore_fd);
    REQUIRED_EXTENSION(KHR_external_memory_fd);
-   REQUIRED_EXTENSION(EXT_external_memory_dma_buf);
-   REQUIRED_EXTENSION(ANDROID_external_memory_android_hardware_buffer);
-
-   /* These feature extensions are enabled by wrapper-owned feature paths. */
-   REQUIRED_EXTENSION(KHR_buffer_device_address);
-   REQUIRED_EXTENSION(KHR_vulkan_memory_model);
+   REQUIRED_EXTENSION(KHR_dedicated_allocation);
+   REQUIRED_EXTENSION(EXT_queue_family_foreign);
+   REQUIRED_EXTENSION(KHR_maintenance1)
+   REQUIRED_EXTENSION(KHR_maintenance2)
+   REQUIRED_EXTENSION(KHR_image_format_list)
+   REQUIRED_EXTENSION(KHR_swapchain);
    REQUIRED_EXTENSION(KHR_timeline_semaphore);
+   REQUIRED_EXTENSION(KHR_get_memory_requirements2);
+   REQUIRED_EXTENSION(KHR_vulkan_memory_model);
+   REQUIRED_EXTENSION(KHR_bind_memory2);
+   REQUIRED_EXTENSION(KHR_copy_commands2);
+   REQUIRED_EXTENSION(EXT_external_memory_host);
+   REQUIRED_EXTENSION(EXT_external_memory_dma_buf);
+   REQUIRED_EXTENSION(EXT_external_memory_acquire_unmodified);
+   REQUIRED_EXTENSION(EXT_image_drm_format_modifier);
+   /*
+    * NOTE: intentionally NOT dropped, despite the "DMA-BUF only" request --
+    * this device also emulates B8G8R8A8 swapchain images via AHB
+    * (see wrapper_CreateImage's is_emulated_bgra8 handling and is_wsi_image
+    * below), which strongly suggests Android's WSI layer here allocates
+    * presentable images through AHardwareBuffer. Removing this extension
+    * would very likely break swapchain/presentation entirely. Flagged in
+    * chat for a decision instead of silently applied.
+    */
+   REQUIRED_EXTENSION(ANDROID_external_memory_android_hardware_buffer);
+   REQUIRED_EXTENSION(KHR_buffer_device_address);
+   REQUIRED_EXTENSION(KHR_driver_properties);
+   REQUIRED_EXTENSION(KHR_device_group);
+   REQUIRED_EXTENSION(KHR_zero_initialize_workgroup_memory);
+   REQUIRED_EXTENSION(EXT_multisampled_render_to_single_sampled);
 #undef REQUIRED_EXTENSION
 }
 
@@ -800,6 +856,9 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
       &wrapper_enable_extension_count, wrapper_enable_extensions);
    wrapper_append_required_extensions(&device->vk,
       &wrapper_enable_extension_count, wrapper_enable_extensions);
+   /* Do not blanket-enable every native extension; forward app requests and
+    * the wrapper's explicit driver dependencies only. */
+
    if (valhall_plan.enforce) {
       wrapper_append_valhall_extensions(&valhall_plan, physical_device,
          &wrapper_enable_extension_count, wrapper_enable_extensions);

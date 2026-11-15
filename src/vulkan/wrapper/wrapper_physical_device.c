@@ -85,7 +85,7 @@ wrapper_setup_device_extensions(struct wrapper_physical_device *pdevice) {
       return result;
    }
 
-   *exts = wrapper_wsi_extensions;
+   *exts = wrapper_device_extensions;
 
    for (uint32_t i = 0; i < pdevice_extension_count; i++) {
       int idx;

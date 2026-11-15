@@ -24,6 +24,7 @@
 
 extern const struct vk_instance_extension_table wrapper_instance_extensions;
 extern const struct vk_device_extension_table wrapper_device_extensions;
+extern const struct vk_device_extension_table wrapper_wsi_extensions;
 extern const struct vk_device_extension_table wrapper_filter_extensions;
 
 struct wrapper_instance {

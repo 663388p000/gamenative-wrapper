@@ -331,70 +331,19 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          ? instance->vk.app_info.engine_name : "wrapper";
       pdevice->wsi_device.engine_name = engine_name;
 
-      const uint32_t engine_version = instance->vk.app_info.engine_version;
 
       /* Arm Mali proprietary driver workarounds */
-      
+
       if (pdevice->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY) {
-         bool is_dxvk = strstr(engine_name, "DXVK");
          bool is_vkd3d = strstr(engine_name, "vkd3d");
-         bool is_d3d = is_dxvk || is_vkd3d;
+         bool is_d3d = strstr(engine_name, "DXVK") || is_vkd3d;
          pdevice->is_vkd3d = is_vkd3d;
-         if (is_d3d) {
-            WRAPPER_LOG(info, "Faking VK_EXT_robustness2 for engine '%s'", engine_name);
-            pdevice->vk.supported_extensions.EXT_robustness2 = true;
-            supported_features->robustBufferAccess2 = true;
-            supported_features->nullDescriptor = true;
-            if (is_dxvk && engine_version >= VK_MAKE_VERSION(2, 7, 0)) {
-               WRAPPER_LOG(info, "Faking VK_KHR_pipeline_library");
-               pdevice->vk.supported_extensions.KHR_pipeline_library = true;
-            }
-            supported_features->extendedDynamicState = true;
-            supported_features->extendedDynamicState2 = true;
-            supported_features->dualSrcBlend = true;
-            supported_features->multiDrawIndirect = true;
-         }
-         /* Spoof both vertex_attribute_divisor extensions as supported. Mali r51
-          * exposes KHR (we forward that); r44 exposes neither, so we advertise
-          * it purely to get vkd3d past its requirement check. Advertising BOTH
-          * (rather than hiding KHR) is fine -- the device-side filter below
-          * forwards whichever alias the base driver actually has, and
-          * process_pnext_chain aliases the feature struct EXT<->KHR to match. */
-         WRAPPER_LOG(info, "Spoofing VK_EXT/KHR_vertex_attribute_divisor as supported");
-         pdevice->vk.supported_extensions.EXT_vertex_attribute_divisor = true;
-         pdevice->vk.supported_extensions.KHR_vertex_attribute_divisor = true;
-         WRAPPER_LOG(info, "Disabling VK_EXT_calibrated_timestamps");
-         pdevice->vk.supported_extensions.EXT_calibrated_timestamps = false;
+
+
          if (!is_d3d) {
             WRAPPER_LOG(info, "Disabling VK_EXT_extended_dynamic_state and VK_EXT_extended_dynamic_state2");
             pdevice->vk.supported_extensions.EXT_extended_dynamic_state = false;
             pdevice->vk.supported_extensions.EXT_extended_dynamic_state2 = false;
-         }
-      }
-
-      /* DXVK > 2.4.1 requires VK_KHR_maintenance5. Some Mali drivers (e.g. r44)
-       * don't expose it. Emulate it for any D3D client whose base driver lacks
-       * it (NOT Samsung-gated -- the base-lacks guard limits it to drivers that
-       * actually need it). Feature faked in Features2, struct unlinked from the
-       * real CreateDevice, entrypoints implemented in wrapper_device.c. */
-      {
-         bool is_d3d = strstr(engine_name, "DXVK") || strstr(engine_name, "vkd3d");
-         if (is_d3d && !pdevice->base_supported_extensions.KHR_maintenance5) {
-            WRAPPER_LOG(info, "Faking VK_KHR_maintenance5 (base driver lacks it)");
-            pdevice->vk.supported_extensions.KHR_maintenance5 = true;
-         }
-      }
-
-      /* VK_KHR_push_descriptor: vkd3d/DXVK effectively require it, but some
-       * drivers (e.g. Mali r44) don't expose it. Advertise + emulate it for D3D
-       * clients whose base driver lacks it. maxPushDescriptors is reported in
-       * wrapper_GetPhysicalDeviceProperties2; the entrypoints are emulated in
-       * wrapper_device.c. */
-      {
-         bool is_d3d = strstr(engine_name, "DXVK") || strstr(engine_name, "vkd3d");
-         if (is_d3d && !pdevice->base_supported_extensions.KHR_push_descriptor) {
-            WRAPPER_LOG(info, "Faking VK_KHR_push_descriptor (base driver lacks it)");
-            pdevice->vk.supported_extensions.KHR_push_descriptor = true;
          }
       }
 
@@ -439,43 +388,7 @@ wrapper_GetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice,
    VK_FROM_HANDLE(wrapper_physical_device, pdevice, physicalDevice);
    vk_common_GetPhysicalDeviceFeatures2(physicalDevice, pFeatures);
 
-   if (pdevice->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY &&
-       pdevice->vk.supported_extensions.EXT_robustness2) {
-      vk_foreach_struct(s, pFeatures->pNext) {
-         if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT) {
-            VkPhysicalDeviceRobustness2FeaturesEXT *r2 =
-               (VkPhysicalDeviceRobustness2FeaturesEXT *)s;
-            r2->robustBufferAccess2 = VK_TRUE;
-            r2->nullDescriptor = VK_TRUE;
-            if (pdevice->is_vkd3d)
-               r2->robustImageAccess2 = VK_TRUE;
-         }
-         if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT) {
-            ((VkPhysicalDeviceExtendedDynamicStateFeaturesEXT *)s)->extendedDynamicState = VK_TRUE;
-         }
-         if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT) {
-            ((VkPhysicalDeviceExtendedDynamicState2FeaturesEXT *)s)->extendedDynamicState2 = VK_TRUE;
-         }
-         if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT) {
-            VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT *vad =
-               (VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT *)s;
-            vad->vertexAttributeInstanceRateDivisor = VK_TRUE;
-            vad->vertexAttributeInstanceRateZeroDivisor = VK_TRUE;
-         }
-      }
-   }
 
-   /* VK_KHR_maintenance5 is emulated by the wrapper for D3D clients when the
-    * Mali driver lacks it (see enumerate_physical_device): report the feature
-    * as available whenever the extension is advertised-but-faked, otherwise
-    * DXVK 2.5+ rejects the device. */
-   if (pdevice->vk.supported_extensions.KHR_maintenance5 &&
-       !pdevice->base_supported_extensions.KHR_maintenance5) {
-      vk_foreach_struct(s, pFeatures->pNext) {
-         if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES)
-            ((VkPhysicalDeviceMaintenance5Features *)s)->maintenance5 = VK_TRUE;
-      }
-   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -576,16 +489,6 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
       	 texel_prop->storageTexelBufferOffsetAlignmentBytes = 1;
       	 texel_prop->uniformTexelBufferOffsetAlignmentBytes = 1;
       	 break;
-      }
-      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES:
-      {
-         /* Only override when we're faking the extension; if the base driver has
-          * it natively it already filled a real limit. */
-         if (pdevice->vk.supported_extensions.KHR_push_descriptor &&
-             !pdevice->base_supported_extensions.KHR_push_descriptor)
-            ((VkPhysicalDevicePushDescriptorProperties *)prop)->maxPushDescriptors =
-               WRAPPER_MAX_PUSH_DESCRIPTORS;
-         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES:
       {

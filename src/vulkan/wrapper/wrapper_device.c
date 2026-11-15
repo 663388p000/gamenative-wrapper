@@ -63,7 +63,7 @@ const struct vk_device_extension_table wrapper_device_extensions =
    .EXT_external_memory_host = true,
    .EXT_external_memory_dma_buf = true,
    .EXT_external_memory_acquire_unmodified = true,
-   .EXT_image_drm_format_modifier = true,
+   .EXT_image_drm_format_modifier = false,
    .ANDROID_external_memory_android_hardware_buffer = true,
    /*
     * VK_EXT_device_fault is appended explicitly in wrapper_CreateDevice()
@@ -71,15 +71,26 @@ const struct vk_device_extension_table wrapper_device_extensions =
     * too so the blanket sweep can't add it a second time.
     */
    .EXT_device_fault = true,
-   /*
-    * Both vertex_attribute_divisor aliases are handled by the dedicated
-    * EXT<->KHR aliasing logic in wrapper_filter_enabled_extensions() and
-    * process_pnext_chain(), which can add whichever alias the app did NOT
-    * request. Keeping both out of the blanket sweep avoids it silently
-    * adding the other alias behind that logic's back.
-    */
-   .EXT_vertex_attribute_divisor = true,
-   .KHR_vertex_attribute_divisor = true,
+};
+
+/*
+ * Extensions the wrapper really implements itself (WSI layer). These are the
+ * ONLY device extensions that are advertised without the Mali driver listing
+ * them. Every other extension is advertised if and only if the driver reports
+ * it -- no fake extensions. (wrapper_device_extensions above is only the
+ * "added to the driver's enable list from exactly one place" skip table.)
+ */
+const struct vk_device_extension_table wrapper_wsi_extensions =
+{
+   .KHR_swapchain = true,
+   .EXT_swapchain_maintenance1 = true,
+   .KHR_swapchain_mutable_format = true,
+#ifdef VK_USE_PLATFORM_DISPLAY_KHR
+   .EXT_display_control = true,
+#endif
+   .KHR_present_id = true,
+   .KHR_present_wait = true,
+   .KHR_incremental_present = true,
 };
 
 /*
@@ -290,23 +301,6 @@ wrapper_filter_enabled_extensions(const struct wrapper_device *device,
          vk_device_extensions[idx].extensionName;
    }
 
-   /* The app enabled one of the vertex_attribute_divisor aliases (both are
-    * advertised). Forward whichever one the base driver actually supports;
-    * symmetric so a future Mali that gains EXT is handled too. On r44 (neither
-    * is present) nothing is forwarded -- the extension is purely spoofed. */
-   if (device->vk.enabled_extensions.EXT_vertex_attribute_divisor &&
-       !device->vk.enabled_extensions.KHR_vertex_attribute_divisor &&
-       device->physical->base_supported_extensions.KHR_vertex_attribute_divisor) {
-      enable_extensions[(*enable_extension_count)++] =
-         "VK_KHR_vertex_attribute_divisor";
-   }
-
-   if (device->vk.enabled_extensions.KHR_vertex_attribute_divisor &&
-       !device->vk.enabled_extensions.EXT_vertex_attribute_divisor &&
-       device->physical->base_supported_extensions.EXT_vertex_attribute_divisor) {
-      enable_extensions[(*enable_extension_count)++] =
-         "VK_EXT_vertex_attribute_divisor";
-   }
 }
 
 /*
@@ -453,17 +447,8 @@ static void process_pnext_chain(VkBaseInStructure *create_info, struct wrapper_p
              continue;
           case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT:
              if (pdevice->base_supported_extensions.EXT_vertex_attribute_divisor)
-                break;   /* base has EXT natively -- pass through unchanged */
-             if (pdevice->base_supported_extensions.KHR_vertex_attribute_divisor) {
-                WRAPPER_LOG(info, "Aliasing VertexAttributeDivisorFeatures EXT->KHR in device pNext");
-                ((VkBaseOutStructure *)current)->sType =
-                   VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR;
                 break;
-             }
-             /* base supports neither alias (e.g. Mali r44): the extension is
-              * purely spoofed, so drop the feature struct rather than hand the
-              * real driver a feature for an extension we didn't enable. */
-             WRAPPER_LOG(info, "Unlinking VertexAttributeDivisorFeaturesEXT (base lacks it)");
+             WRAPPER_LOG(info, "Unlinking VertexAttributeDivisorFeaturesEXT (driver lacks the EXT extension)");
              unlink_vk_struct(create_info, &current, &prev);
              continue;
           case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES:
@@ -717,214 +702,6 @@ wrapper_create_device_queue(struct wrapper_device *device,
    return VK_SUCCESS;
 }
 
-static void
-wrapper_create_null_resources(struct wrapper_device *device)
-{
-   const struct vk_device_dispatch_table *dt = &device->dispatch_table;
-   VkDevice dev = device->dispatch_handle;
-   VkPhysicalDeviceMemoryProperties *mp = &device->physical->memory_properties;
-
-   VkBufferCreateInfo bci = {
-      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-      .size = 65536,
-      .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-               VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT,
-      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-   };
-   if (dt->CreateBuffer(dev, &bci, NULL, &device->null_buffer) != VK_SUCCESS)
-      return;
-   VkMemoryRequirements mr;
-   dt->GetBufferMemoryRequirements(dev, device->null_buffer, &mr);
-   uint32_t mt = UINT32_MAX;
-   for (uint32_t i = 0; i < mp->memoryTypeCount; i++)
-      if ((mr.memoryTypeBits & (1u << i)) &&
-          (mp->memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) { mt = i; break; }
-   if (mt == UINT32_MAX) return;
-   VkMemoryAllocateInfo mai = {
-      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-      .allocationSize = mr.size, .memoryTypeIndex = mt,
-   };
-   if (dt->AllocateMemory(dev, &mai, NULL, &device->null_buffer_memory) != VK_SUCCESS)
-      return;
-   dt->BindBufferMemory(dev, device->null_buffer, device->null_buffer_memory, 0);
-   void *ptr = NULL;
-   if (dt->MapMemory(dev, device->null_buffer_memory, 0, VK_WHOLE_SIZE, 0, &ptr) == VK_SUCCESS) {
-      memset(ptr, 0, mr.size);
-      dt->UnmapMemory(dev, device->null_buffer_memory);
-   }
-
-   VkImageCreateInfo ici = {
-      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-      .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
-      .extent = { 1, 1, 1 }, .mipLevels = 1, .arrayLayers = 1,
-      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
-      .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
-      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-   };
-   if (dt->CreateImage(dev, &ici, NULL, &device->null_image) == VK_SUCCESS) {
-      VkMemoryRequirements imr;
-      dt->GetImageMemoryRequirements(dev, device->null_image, &imr);
-      uint32_t imt = UINT32_MAX;
-      for (uint32_t i = 0; i < mp->memoryTypeCount; i++)
-         if (imr.memoryTypeBits & (1u << i)) { imt = i; break; }
-      VkMemoryAllocateInfo imai = {
-         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-         .allocationSize = imr.size, .memoryTypeIndex = imt,
-      };
-      if (imt != UINT32_MAX &&
-          dt->AllocateMemory(dev, &imai, NULL, &device->null_image_memory) == VK_SUCCESS) {
-         dt->BindImageMemory(dev, device->null_image, device->null_image_memory, 0);
-         VkImageViewCreateInfo vci = {
-            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            .image = device->null_image, .viewType = VK_IMAGE_VIEW_TYPE_2D,
-            .format = VK_FORMAT_R8G8B8A8_UNORM,
-            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
-         };
-         dt->CreateImageView(dev, &vci, NULL, &device->null_image_view);
-      }
-   }
-   VkSamplerCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-   dt->CreateSampler(dev, &sci, NULL, &device->null_sampler);
-}
-
-static void
-wrapper_destroy_null_resources(struct wrapper_device *device)
-{
-   const struct vk_device_dispatch_table *dt = &device->dispatch_table;
-   VkDevice dev = device->dispatch_handle;
-
-   if (device->null_sampler)
-      dt->DestroySampler(dev, device->null_sampler, NULL);
-   if (device->null_image_view)
-      dt->DestroyImageView(dev, device->null_image_view, NULL);
-   if (device->null_image)
-      dt->DestroyImage(dev, device->null_image, NULL);
-   if (device->null_image_memory)
-      dt->FreeMemory(dev, device->null_image_memory, NULL);
-   if (device->null_buffer)
-      dt->DestroyBuffer(dev, device->null_buffer, NULL);
-   if (device->null_buffer_memory)
-      dt->FreeMemory(dev, device->null_buffer_memory, NULL);
-
-   device->null_sampler = VK_NULL_HANDLE;
-   device->null_image_view = VK_NULL_HANDLE;
-   device->null_image = VK_NULL_HANDLE;
-   device->null_image_memory = VK_NULL_HANDLE;
-   device->null_buffer = VK_NULL_HANDLE;
-   device->null_buffer_memory = VK_NULL_HANDLE;
-}
-
-VKAPI_ATTR void VKAPI_CALL
-wrapper_UpdateDescriptorSets(VkDevice _device, uint32_t descriptorWriteCount,
-                             const VkWriteDescriptorSet *pDescriptorWrites,
-                             uint32_t descriptorCopyCount,
-                             const VkCopyDescriptorSet *pDescriptorCopies)
-{
-   VK_FROM_HANDLE(wrapper_device, device, _device);
-
-   if (!device->emulate_null_descriptor || descriptorWriteCount == 0) {
-      device->dispatch_table.UpdateDescriptorSets(device->dispatch_handle,
-         descriptorWriteCount, pDescriptorWrites, descriptorCopyCount, pDescriptorCopies);
-      return;
-   }
-
-   VkWriteDescriptorSet *writes =
-      malloc(sizeof(VkWriteDescriptorSet) * descriptorWriteCount);
-   memcpy(writes, pDescriptorWrites, sizeof(VkWriteDescriptorSet) * descriptorWriteCount);
-
-   for (uint32_t i = 0; i < descriptorWriteCount; i++) {
-      const VkWriteDescriptorSet *w = &pDescriptorWrites[i];
-      uint32_t n = w->descriptorCount;
-      switch (w->descriptorType) {
-      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
-      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
-      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
-      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: {
-         VkDescriptorBufferInfo *bi = malloc(sizeof(*bi) * n);
-         memcpy(bi, w->pBufferInfo, sizeof(*bi) * n);
-         for (uint32_t j = 0; j < n; j++)
-            if (bi[j].buffer == VK_NULL_HANDLE) {
-               bi[j].buffer = device->null_buffer;
-               bi[j].offset = 0; bi[j].range = VK_WHOLE_SIZE;
-            }
-         writes[i].pBufferInfo = bi;
-         break;
-      }
-      case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
-      case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
-      case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-      case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
-      case VK_DESCRIPTOR_TYPE_SAMPLER: {
-         VkDescriptorImageInfo *ii = malloc(sizeof(*ii) * n);
-         memcpy(ii, w->pImageInfo, sizeof(*ii) * n);
-         for (uint32_t j = 0; j < n; j++) {
-            if ((w->descriptorType != VK_DESCRIPTOR_TYPE_SAMPLER) &&
-                ii[j].imageView == VK_NULL_HANDLE) {
-               ii[j].imageView = device->null_image_view;
-               ii[j].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            }
-            if ((w->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER ||
-                 w->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) &&
-                ii[j].sampler == VK_NULL_HANDLE)
-               ii[j].sampler = device->null_sampler;
-         }
-         writes[i].pImageInfo = ii;
-         break;
-      }
-      default:
-         break;
-      }
-   }
-
-   device->dispatch_table.UpdateDescriptorSets(device->dispatch_handle,
-      descriptorWriteCount, writes, descriptorCopyCount, pDescriptorCopies);
-
-   for (uint32_t i = 0; i < descriptorWriteCount; i++) {
-      if (writes[i].pBufferInfo != pDescriptorWrites[i].pBufferInfo)
-         free((void *)writes[i].pBufferInfo);
-      if (writes[i].pImageInfo != pDescriptorWrites[i].pImageInfo)
-         free((void *)writes[i].pImageInfo);
-   }
-   free(writes);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-wrapper_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBinding,
-                             uint32_t bindingCount, const VkBuffer *pBuffers,
-                             const VkDeviceSize *pOffsets, const VkDeviceSize *pSizes,
-                             const VkDeviceSize *pStrides)
-{
-   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
-   struct wrapper_device *device = wcb->device;
-   VkBuffer *bufs = NULL;
-   if (device->emulate_null_descriptor && pBuffers) {
-      bufs = malloc(sizeof(VkBuffer) * bindingCount);
-      for (uint32_t i = 0; i < bindingCount; i++)
-         bufs[i] = pBuffers[i] ? pBuffers[i] : device->null_buffer;
-   }
-   device->dispatch_table.CmdBindVertexBuffers2(wcb->dispatch_handle, firstBinding,
-      bindingCount, bufs ? bufs : pBuffers, pOffsets, pSizes, pStrides);
-   free(bufs);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-wrapper_CmdBindVertexBuffers(VkCommandBuffer commandBuffer, uint32_t firstBinding,
-                            uint32_t bindingCount, const VkBuffer *pBuffers,
-                            const VkDeviceSize *pOffsets)
-{
-   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
-   struct wrapper_device *device = wcb->device;
-   VkBuffer *bufs = NULL;
-   if (device->emulate_null_descriptor && pBuffers) {
-      bufs = malloc(sizeof(VkBuffer) * bindingCount);
-      for (uint32_t i = 0; i < bindingCount; i++)
-         bufs[i] = pBuffers[i] ? pBuffers[i] : device->null_buffer;
-   }
-   device->dispatch_table.CmdBindVertexBuffers(wcb->dispatch_handle, firstBinding,
-      bindingCount, bufs ? bufs : pBuffers, pOffsets);
-   free(bufs);
-}
-
 static const char *
 wrapper_driver_id_str(VkDriverId id)
 {
@@ -1043,9 +820,21 @@ wrapper_emit_diag(struct wrapper_physical_device *pdev,
    D("  ext EXT_robustness2              : %d\n", pdev->base_supported_extensions.EXT_robustness2);
    D("  ext EXT_vertex_attribute_divisor : %d\n", pdev->base_supported_extensions.EXT_vertex_attribute_divisor);
    D("  ext KHR_vertex_attribute_divisor : %d\n", pdev->base_supported_extensions.KHR_vertex_attribute_divisor);
-   D("--- wrapper overrides advertised to the D3D layer ---\n");
-   D("  WRAPPER_VK_VERSION advertised : %s\n",
-     getenv("WRAPPER_VK_VERSION") ? getenv("WRAPPER_VK_VERSION") : "(driver default)");
+   {
+      /* extensions advertised although the driver does not list them: only the
+       * wrapper-implemented ones (WSI, map_memory_placed/map_memory2) may show up */
+      unsigned not_in_driver = 0;
+      D("--- extensions advertised without driver support ---\n");
+      for (int i = 0; i < VK_DEVICE_EXTENSION_COUNT; i++) {
+         if (pdev->vk.supported_extensions.extensions[i] &&
+             !pdev->base_supported_extensions.extensions[i]) {
+            D("  %s%s\n", vk_device_extensions[i].extensionName,
+              wrapper_wsi_extensions.extensions[i] ? " (wrapper WSI)" : " (wrapper implemented)");
+            not_in_driver++;
+         }
+      }
+      D("  total: %u\n", not_in_driver);
+   }
    D("--- Mali / kernel interfaces ---\n");
    D("  kbase %s: ABI %u.%u GPU_ID=0x%08x arch=v%u cores=%u (%s) L2=%uKiB/%uB x%u threads=%u\n",
      WRAPPER_KBASE_NODE, pdev->mali.kbase_uk_major, pdev->mali.kbase_uk_minor,
@@ -1062,20 +851,10 @@ wrapper_emit_diag(struct wrapper_physical_device *pdev,
    D("  memory backend: AHardwareBuffer (zero-copy) -> DRM dma-buf only for dma-buf-only resources\n");
    D("  persistent pipeline cache: %s\n",
      (getenv("WRAPPER_PIPELINE_CACHE") && !atoi(getenv("WRAPPER_PIPELINE_CACHE"))) ? "off" : "on");
-   D("  faking VK_EXT_robustness2     : %s\n",
-     (pdev->vk.supported_extensions.EXT_robustness2 && !pdev->base_supported_extensions.EXT_robustness2) ? "YES" : "no");
-   D("  vertex_attr_divisor EXT alias : %s\n",
-     (pdev->vk.supported_extensions.EXT_vertex_attribute_divisor && !pdev->base_supported_extensions.EXT_vertex_attribute_divisor) ? "YES (aliased from KHR)" : "no");
    D("  VK_EXT_device_fault report    : %s\n",
      !pdev->base_supported_extensions.EXT_device_fault ? "unsupported by base driver" :
      (!getenv("WRAPPER_DEVICE_FAULT") || atoi(getenv("WRAPPER_DEVICE_FAULT")))
         ? "ON (GPU fault dumped on device loss)" : "off (WRAPPER_DEVICE_FAULT=0)");
-   D("  push_descriptor emulation     : %s\n",
-     (getenv("WRAPPER_EMULATE_PUSH_DESCRIPTOR") && atoi(getenv("WRAPPER_EMULATE_PUSH_DESCRIPTOR")))
-        ? "ON (forced)" :
-     (pdev->vk.supported_extensions.KHR_push_descriptor && !pdev->base_supported_extensions.KHR_push_descriptor)
-        ? "ON (base lacks it)" :
-     pdev->base_supported_extensions.KHR_push_descriptor ? "off (native)" : "off");
    D("--- vkCreateDevice ---\n");
    D("  result: %d (%s)\n", result, result == VK_SUCCESS ? "VK_SUCCESS" : "FAILED");
    D("  requested device extensions (%u):\n", ci ? ci->enabledExtensionCount : 0);
@@ -1114,21 +893,17 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    bool used_fallback_create = false;
 
    /*
-    * VK_KHR_buffer_device_address is mandatory for this wrapper (relied on
-    * internally, not merely forwarded). Fail fast, before allocating
-    * anything, if the driver can't actually back it.
+    * bufferDeviceAddress is switched on whenever the driver can back it, but it
+    * must never make vkCreateDevice fail: Arm's 32-bit driver build has no
+    * 64-bit GPU VA space and does not expose it, which used to turn every
+    * 32-bit process into VK_ERROR_FEATURE_NOT_PRESENT.
     */
-   if (!physical_device->base_supported_extensions.KHR_buffer_device_address &&
-       physical_device->properties2.properties.apiVersion < VK_API_VERSION_1_2) {
-      WRAPPER_LOG(error, "Driver lacks mandatory VK_KHR_buffer_device_address");
-      wrapper_emit_diag(physical_device, pCreateInfo, VK_ERROR_EXTENSION_NOT_PRESENT);
-      return vk_error(physical_device, VK_ERROR_EXTENSION_NOT_PRESENT);
-   }
-   if (!physical_device->base_supported_features.bufferDeviceAddress) {
-      WRAPPER_LOG(error, "Driver lacks mandatory bufferDeviceAddress feature");
-      wrapper_emit_diag(physical_device, pCreateInfo, VK_ERROR_FEATURE_NOT_PRESENT);
-      return vk_error(physical_device, VK_ERROR_FEATURE_NOT_PRESENT);
-   }
+   const bool enable_bda =
+      physical_device->base_supported_features.bufferDeviceAddress &&
+      (physical_device->base_supported_extensions.KHR_buffer_device_address ||
+       physical_device->properties2.properties.apiVersion >= VK_API_VERSION_1_2);
+   if (!enable_bda)
+      WRAPPER_LOG(info, "Driver has no bufferDeviceAddress, continuing without it");
 
    /*
     * GPU/driver identification -- read straight off the device, never
@@ -1237,8 +1012,9 @@ if (pdf2 && pdf2->features.f) { \
     * CreateDevice() call below, so they live in this stack frame rather
     * than inside the helper functions. */
    VkPhysicalDeviceBufferDeviceAddressFeatures wrapper_bda_features = {0};
-   wrapper_force_buffer_device_address(
-      (VkBaseInStructure *)&wrapper_create_info, &wrapper_bda_features);
+   if (enable_bda)
+      wrapper_force_buffer_device_address(
+         (VkBaseInStructure *)&wrapper_create_info, &wrapper_bda_features);
 
    VkPhysicalDeviceVulkanMemoryModelFeatures wrapper_vmm_features = {0};
    wrapper_use_vulkan_memory_model(
@@ -1315,36 +1091,6 @@ if (pdf2 && pdf2->features.f) { \
    /* Persistent pipeline cache (Mali compiles are slow): see wrapper_pipeline_cache.c */
    wrapper_pcache_create(device);
 
-   device->emulate_null_descriptor =
-      physical_device->vk.supported_extensions.EXT_robustness2 &&
-      !physical_device->base_supported_features.nullDescriptor;
-   if (device->emulate_null_descriptor) {
-      WRAPPER_LOG(info, "Emulating nullDescriptor with canonical zero resources");
-      wrapper_create_null_resources(device);
-   }
-
-   /* Push-descriptor emulation: on when the app enabled VK_KHR_push_descriptor
-    * and either the base driver lacks it or WRAPPER_EMULATE_PUSH_DESCRIPTOR
-    * forces it (so it can be validated on a device that has it natively). */
-   {
-      static int force = -1;
-      if (force == -1)
-         force = getenv("WRAPPER_EMULATE_PUSH_DESCRIPTOR")
-            ? atoi(getenv("WRAPPER_EMULATE_PUSH_DESCRIPTOR")) : 0;
-      bool app_wants = device->vk.enabled_extensions.KHR_push_descriptor;
-      bool base_has = physical_device->base_supported_extensions.KHR_push_descriptor;
-      device->emulate_push_descriptor = app_wants && (force || !base_has);
-      if (device->emulate_push_descriptor) {
-         WRAPPER_LOG(info, "Emulating VK_KHR_push_descriptor%s",
-                     (base_has && force) ? " (forced; base has it natively)" : "");
-         device->max_push_descriptors = WRAPPER_MAX_PUSH_DESCRIPTORS;
-         simple_mtx_init(&device->push_mutex, mtx_plain);
-         device->push_dsl_table = _mesa_hash_table_u64_create(NULL);
-         device->push_pl_table = _mesa_hash_table_u64_create(NULL);
-         device->push_template_table = _mesa_hash_table_u64_create(NULL);
-      }
-   }
-
    result = wrapper_create_device_queue(device, pCreateInfo);
    if (result != VK_SUCCESS) {
       wrapper_DestroyDevice(wrapper_device_to_handle(device),
@@ -1402,22 +1148,6 @@ wrapper_CreateBuffer(VkDevice _device,
    VK_FROM_HANDLE(wrapper_device, device, _device);
    VkResult res;
    VkExternalMemoryHandleTypeFlags handle_types = 0;
-
-   /* When we fake VK_KHR_maintenance5 (base driver lacks it, e.g. Xclipse),
-    * DXVK specifies buffer usage through VkBufferUsageFlags2CreateInfo and may
-    * leave the 32-bit VkBufferCreateInfo::usage as 0. The base driver ignores
-    * the unknown pNext struct, so fold the flags2 usage back into the 32-bit
-    * field before forwarding. */
-   VkBufferCreateInfo local_create_info;
-   if (!device->physical->base_supported_extensions.KHR_maintenance5) {
-      const VkBufferUsageFlags2CreateInfo *uf2 = __vk_find_struct(
-         (void *)pCreateInfo->pNext, VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO);
-      if (uf2) {
-         local_create_info = *pCreateInfo;
-         local_create_info.usage |= (VkBufferUsageFlags)uf2->usage;
-         pCreateInfo = &local_create_info;
-      }
-   }
 
    const VkExternalMemoryBufferCreateInfo *ext_info =
       vk_find_struct_const(pCreateInfo->pNext, EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
@@ -1500,15 +1230,15 @@ wrapper_CreateImage(VkDevice _device,
    VK_FROM_HANDLE(wrapper_device, device, _device);
    VkResult res;
    VkImageCreateInfo create_info;
-   bool is_emulated_bgra8 = false;
    bool is_wsi_image = false;
    VkExternalMemoryHandleTypeFlags handle_types = 0;
 
-   // Wrapper specific extension for B8G8R8A8 AHB img emulation for the swapchain
+   /* No B8G8R8A8 emulation lives in the wrapper any more. If the WSI layer still
+    * tags an image with its private marker struct, just drop the marker so the
+    * driver never sees an unknown struct. */
    VkBaseInStructure *prev = (VkBaseInStructure *) pCreateInfo;
    for (const VkBaseInStructure *s = pCreateInfo->pNext; s; s = s->pNext) {
       if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EMULATED_B8G8R8A8_CREATE_INFO_EXT) {
-         is_emulated_bgra8 = true;
          prev->pNext = s->pNext; // unlink
          break;
       }
@@ -1528,10 +1258,9 @@ wrapper_CreateImage(VkDevice _device,
       handle_types = ext_info->handleTypes;
    }
 
-   /* Copy after the unlink above: when the emulated-bgra8 struct is the
-    * head of the pNext chain, the unlink only updates pCreateInfo->pNext,
-    * so a copy taken earlier would still pass the unknown struct to the
-    * driver. */
+   /* Copy after the unlink above: when the marker struct is the head of the
+    * pNext chain, the unlink only updates pCreateInfo->pNext, so a copy taken
+    * earlier would still pass the unknown struct to the driver. */
    create_info = *pCreateInfo;
 
    res = device->dispatch_table.CreateImage(device->dispatch_handle,
@@ -1557,7 +1286,6 @@ wrapper_CreateImage(VkDevice _device,
 
    wi->device = device;
    wi->dispatch_handle = *pImage;
-   wi->is_emulated_bgra8 = is_emulated_bgra8;
    wi->is_wsi_image = is_wsi_image;
    wi->handle_types = handle_types;
 
@@ -1604,565 +1332,10 @@ wrapper_GetDeviceQueue2(VkDevice _device, const VkDeviceQueueInfo2* pQueueInfo,
    *pQueue = queue ? vk_queue_to_handle(queue) : VK_NULL_HANDLE;
 }
 
-/* ---- VK_KHR_maintenance5 emulation ------------------------------------------
- * DXVK > 2.4.1 requires VK_KHR_maintenance5, which Xclipse (and other drivers)
- * don't expose. We advertise + fake the feature (wrapper_physical_device.c) and
- * implement its new entrypoints here. Each prefers the base driver's native
- * implementation when present (so this is harmless on drivers that already have
- * maintenance5, e.g. Mali) and otherwise translates to the pre-maintenance5
- * equivalent. */
-
-VKAPI_ATTR void VKAPI_CALL
-wrapper_CmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer, VkBuffer buffer,
-                               VkDeviceSize offset, VkDeviceSize size,
-                               VkIndexType indexType) {
-   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
-   struct wrapper_device *device = wcb->device;
-
-   if (device->dispatch_table.CmdBindIndexBuffer2)
-      device->dispatch_table.CmdBindIndexBuffer2(wcb->dispatch_handle, buffer, offset, size, indexType);
-   else if (device->dispatch_table.CmdBindIndexBuffer2KHR)
-      device->dispatch_table.CmdBindIndexBuffer2KHR(wcb->dispatch_handle, buffer, offset, size, indexType);
-   else /* pre-maintenance5: the size parameter is a robustness bound; dropping it is safe */
-      device->dispatch_table.CmdBindIndexBuffer(wcb->dispatch_handle, buffer, offset, indexType);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-wrapper_GetRenderingAreaGranularityKHR(VkDevice _device,
-                                       const VkRenderingAreaInfo *pRenderingAreaInfo,
-                                       VkExtent2D *pGranularity) {
-   VK_FROM_HANDLE(wrapper_device, device, _device);
-
-   if (device->dispatch_table.GetRenderingAreaGranularity)
-      device->dispatch_table.GetRenderingAreaGranularity(device->dispatch_handle, pRenderingAreaInfo, pGranularity);
-   else if (device->dispatch_table.GetRenderingAreaGranularityKHR)
-      device->dispatch_table.GetRenderingAreaGranularityKHR(device->dispatch_handle, pRenderingAreaInfo, pGranularity);
-   else /* {1,1} is always a valid render-area granularity */
-      *pGranularity = (VkExtent2D){ 1, 1 };
-}
-
-VKAPI_ATTR void VKAPI_CALL
-wrapper_GetImageSubresourceLayout2KHR(VkDevice _device, VkImage image,
-                                      const VkImageSubresource2 *pSubresource,
-                                      VkSubresourceLayout2 *pLayout) {
-   VK_FROM_HANDLE(wrapper_device, device, _device);
-
-   if (device->dispatch_table.GetImageSubresourceLayout2)
-      device->dispatch_table.GetImageSubresourceLayout2(device->dispatch_handle, image, pSubresource, pLayout);
-   else if (device->dispatch_table.GetImageSubresourceLayout2KHR)
-      device->dispatch_table.GetImageSubresourceLayout2KHR(device->dispatch_handle, image, pSubresource, pLayout);
-   else if (device->dispatch_table.GetImageSubresourceLayout2EXT)
-      device->dispatch_table.GetImageSubresourceLayout2EXT(device->dispatch_handle, image, pSubresource, pLayout);
-   else
-      device->dispatch_table.GetImageSubresourceLayout(device->dispatch_handle, image,
-         &pSubresource->imageSubresource, &pLayout->subresourceLayout);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-wrapper_GetDeviceImageSubresourceLayoutKHR(VkDevice _device,
-                                           const VkDeviceImageSubresourceInfo *pInfo,
-                                           VkSubresourceLayout2 *pLayout) {
-   VK_FROM_HANDLE(wrapper_device, device, _device);
-
-   if (device->dispatch_table.GetDeviceImageSubresourceLayout) {
-      device->dispatch_table.GetDeviceImageSubresourceLayout(device->dispatch_handle, pInfo, pLayout);
-      return;
-   }
-   if (device->dispatch_table.GetDeviceImageSubresourceLayoutKHR) {
-      device->dispatch_table.GetDeviceImageSubresourceLayoutKHR(device->dispatch_handle, pInfo, pLayout);
-      return;
-   }
-
-   /* Emulate via a transient image: create it, query the subresource layout,
-    * destroy it. Use the base dispatch directly to avoid wrapper bookkeeping. */
-   VkImage tmp;
-   if (device->dispatch_table.CreateImage(device->dispatch_handle,
-          pInfo->pCreateInfo, NULL, &tmp) == VK_SUCCESS) {
-      device->dispatch_table.GetImageSubresourceLayout(device->dispatch_handle, tmp,
-         &pInfo->pSubresource->imageSubresource, &pLayout->subresourceLayout);
-      device->dispatch_table.DestroyImage(device->dispatch_handle, tmp, NULL);
-   }
-}
-
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 wrapper_GetDeviceProcAddr(VkDevice _device, const char* pName) {
    VK_FROM_HANDLE(wrapper_device, device, _device);
    return vk_device_get_proc_addr(&device->vk, pName);
-}
-
-/* ---- VK_KHR_push_descriptor emulation -------------------------------------
- * Drivers that lack push descriptors (e.g. Mali r44) can't run vkd3d/DXVK,
- * which require them. We translate each push into: allocate a descriptor set
- * from a per-command-buffer pool, update it, then bind it normally. Descriptor
- * set layouts get the push-bit stripped at creation (so they're allocatable);
- * push templates are converted to normal DESCRIPTOR_SET templates. Everything
- * here is a thin pass-through unless device->emulate_push_descriptor is set. */
-
-#define WRAPPER_PUSH_POOL_CHUNK 64
-
-static void
-wrapper_push_pool_reset_all(struct wrapper_command_buffer *wcb)
-{
-   struct wrapper_device *device = wcb->device;
-   for (struct wrapper_push_pool *p = wcb->push_pools; p; p = p->next) {
-      device->dispatch_table.ResetDescriptorPool(device->dispatch_handle, p->pool, 0);
-      p->remaining = WRAPPER_PUSH_POOL_CHUNK;
-   }
-}
-
-static void
-wrapper_push_pool_destroy_all(struct wrapper_command_buffer *wcb)
-{
-   struct wrapper_device *device = wcb->device;
-   struct wrapper_push_pool *p = wcb->push_pools;
-   while (p) {
-      struct wrapper_push_pool *next = p->next;
-      device->dispatch_table.DestroyDescriptorPool(device->dispatch_handle, p->pool, NULL);
-      free(p);
-      p = next;
-   }
-   wcb->push_pools = NULL;
-}
-
-/* Allocate one descriptor set of `layout` from a per-CB chunked pool sized from
- * the layout's bindings. Pools specialize per layout: an allocation that can't
- * be served by an existing pool spins up a new one. */
-static VkResult
-wrapper_push_alloc_set(struct wrapper_command_buffer *wcb,
-                       VkDescriptorSetLayout layout,
-                       const struct wrapper_push_dsl *dsl,
-                       VkDescriptorSet *out)
-{
-   struct wrapper_device *device = wcb->device;
-   const struct vk_device_dispatch_table *dt = &device->dispatch_table;
-
-   struct wrapper_push_pool *p = wcb->push_pools;
-   for (; p; p = p->next)
-      if (p->layout == layout && p->remaining > 0)
-         break;
-
-   if (!p) {
-      VkDescriptorPoolSize sizes[16];
-      for (uint32_t i = 0; i < dsl->size_count; i++) {
-         sizes[i].type = dsl->sizes[i].type;
-         sizes[i].descriptorCount =
-            dsl->sizes[i].descriptorCount * WRAPPER_PUSH_POOL_CHUNK;
-      }
-      VkDescriptorPoolCreateInfo pci = {
-         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-         .maxSets = WRAPPER_PUSH_POOL_CHUNK,
-         .poolSizeCount = dsl->size_count,
-         .pPoolSizes = sizes,
-      };
-      VkDescriptorPool pool;
-      VkResult r = dt->CreateDescriptorPool(device->dispatch_handle, &pci, NULL, &pool);
-      if (r != VK_SUCCESS)
-         return r;
-      p = malloc(sizeof(*p));
-      if (!p) {
-         dt->DestroyDescriptorPool(device->dispatch_handle, pool, NULL);
-         return VK_ERROR_OUT_OF_HOST_MEMORY;
-      }
-      p->pool = pool;
-      p->layout = layout;
-      p->remaining = WRAPPER_PUSH_POOL_CHUNK;
-      p->next = wcb->push_pools;
-      wcb->push_pools = p;
-   }
-
-   VkDescriptorSetAllocateInfo ai = {
-      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-      .descriptorPool = p->pool,
-      .descriptorSetCount = 1,
-      .pSetLayouts = &layout,
-   };
-   VkResult r = dt->AllocateDescriptorSets(device->dispatch_handle, &ai, out);
-   if (r == VK_SUCCESS)
-      p->remaining--;
-   return r;
-}
-
-/* Resolve (pipelineLayout, set) -> the push set's layout handle + its record. */
-static struct wrapper_push_dsl *
-wrapper_push_resolve(struct wrapper_device *device, VkPipelineLayout layout,
-                     uint32_t set, VkDescriptorSetLayout *out_handle)
-{
-   struct wrapper_push_dsl *dsl = NULL;
-   *out_handle = VK_NULL_HANDLE;
-   simple_mtx_lock(&device->push_mutex);
-   struct wrapper_push_pl *pl =
-      _mesa_hash_table_u64_search(device->push_pl_table, (uint64_t)layout);
-   if (pl && set < pl->set_layout_count) {
-      *out_handle = pl->set_layouts[set];
-      dsl = _mesa_hash_table_u64_search(device->push_dsl_table,
-                                        (uint64_t)*out_handle);
-   }
-   simple_mtx_unlock(&device->push_mutex);
-   return dsl;
-}
-
-static void
-wrapper_emulate_push_descriptor(struct wrapper_command_buffer *wcb,
-                                VkPipelineBindPoint bindPoint,
-                                VkPipelineLayout layout, uint32_t set,
-                                uint32_t writeCount,
-                                const VkWriteDescriptorSet *pWrites)
-{
-   struct wrapper_device *device = wcb->device;
-   const struct vk_device_dispatch_table *dt = &device->dispatch_table;
-
-   VkDescriptorSetLayout dsl_handle;
-   struct wrapper_push_dsl *dsl =
-      wrapper_push_resolve(device, layout, set, &dsl_handle);
-
-   if (!dsl || dsl->size_count == 0 || dsl_handle == VK_NULL_HANDLE) {
-      if (dt->CmdPushDescriptorSetKHR)
-         dt->CmdPushDescriptorSetKHR(wcb->dispatch_handle, bindPoint, layout,
-                                     set, writeCount, pWrites);
-      else
-         WRAPPER_LOG(error, "push descriptor: no layout record for set %u", set);
-      return;
-   }
-
-   VkDescriptorSet dset;
-   if (wrapper_push_alloc_set(wcb, dsl_handle, dsl, &dset) != VK_SUCCESS)
-      return;
-
-   /* Point the writes at our set and route through wrapper_UpdateDescriptorSets
-    * so nullDescriptor emulation (if active) still applies. */
-   VkWriteDescriptorSet *writes = malloc(sizeof(*writes) * writeCount);
-   if (!writes)
-      return;
-   memcpy(writes, pWrites, sizeof(*writes) * writeCount);
-   for (uint32_t i = 0; i < writeCount; i++)
-      writes[i].dstSet = dset;
-   wrapper_UpdateDescriptorSets(wrapper_device_to_handle(device),
-                                writeCount, writes, 0, NULL);
-   free(writes);
-
-   dt->CmdBindDescriptorSets(wcb->dispatch_handle, bindPoint, layout, set,
-                             1, &dset, 0, NULL);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-wrapper_CmdPushDescriptorSetKHR(VkCommandBuffer commandBuffer,
-                               VkPipelineBindPoint pipelineBindPoint,
-                               VkPipelineLayout layout, uint32_t set,
-                               uint32_t descriptorWriteCount,
-                               const VkWriteDescriptorSet *pDescriptorWrites)
-{
-   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
-   if (!wcb->device->emulate_push_descriptor) {
-      wcb->device->dispatch_table.CmdPushDescriptorSetKHR(wcb->dispatch_handle,
-         pipelineBindPoint, layout, set, descriptorWriteCount, pDescriptorWrites);
-      return;
-   }
-   wrapper_emulate_push_descriptor(wcb, pipelineBindPoint, layout, set,
-                                   descriptorWriteCount, pDescriptorWrites);
-}
-
-static void
-wrapper_emulate_push_descriptor_template(struct wrapper_command_buffer *wcb,
-                                         VkDescriptorUpdateTemplate tpl_handle,
-                                         VkPipelineLayout layout, uint32_t set,
-                                         const void *pData)
-{
-   struct wrapper_device *device = wcb->device;
-   const struct vk_device_dispatch_table *dt = &device->dispatch_table;
-
-   simple_mtx_lock(&device->push_mutex);
-   struct wrapper_push_template *tpl =
-      _mesa_hash_table_u64_search(device->push_template_table, (uint64_t)tpl_handle);
-   VkPipelineBindPoint bp = tpl ? tpl->bind_point : VK_PIPELINE_BIND_POINT_GRAPHICS;
-   simple_mtx_unlock(&device->push_mutex);
-
-   VkDescriptorSetLayout dsl_handle;
-   struct wrapper_push_dsl *dsl =
-      wrapper_push_resolve(device, layout, set, &dsl_handle);
-
-   if (!dsl || dsl->size_count == 0 || dsl_handle == VK_NULL_HANDLE) {
-      if (dt->CmdPushDescriptorSetWithTemplateKHR)
-         dt->CmdPushDescriptorSetWithTemplateKHR(wcb->dispatch_handle,
-            tpl_handle, layout, set, pData);
-      return;
-   }
-
-   VkDescriptorSet dset;
-   if (wrapper_push_alloc_set(wcb, dsl_handle, dsl, &dset) != VK_SUCCESS)
-      return;
-
-   /* The template was rewritten to DESCRIPTOR_SET type at creation, so the
-    * driver's normal template apply works on our allocated set. */
-   PFN_vkUpdateDescriptorSetWithTemplate upd =
-      dt->UpdateDescriptorSetWithTemplate ? dt->UpdateDescriptorSetWithTemplate
-                                          : dt->UpdateDescriptorSetWithTemplateKHR;
-   upd(device->dispatch_handle, dset, tpl_handle, pData);
-   dt->CmdBindDescriptorSets(wcb->dispatch_handle, bp, layout, set,
-                             1, &dset, 0, NULL);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-wrapper_CmdPushDescriptorSetWithTemplateKHR(VkCommandBuffer commandBuffer,
-                                           VkDescriptorUpdateTemplate descriptorUpdateTemplate,
-                                           VkPipelineLayout layout, uint32_t set,
-                                           const void *pData)
-{
-   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
-   if (!wcb->device->emulate_push_descriptor) {
-      wcb->device->dispatch_table.CmdPushDescriptorSetWithTemplateKHR(
-         wcb->dispatch_handle, descriptorUpdateTemplate, layout, set, pData);
-      return;
-   }
-   wrapper_emulate_push_descriptor_template(wcb, descriptorUpdateTemplate,
-                                            layout, set, pData);
-}
-
-VKAPI_ATTR VkResult VKAPI_CALL
-wrapper_CreateDescriptorSetLayout(VkDevice _device,
-                                 const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
-                                 const VkAllocationCallbacks *pAllocator,
-                                 VkDescriptorSetLayout *pSetLayout)
-{
-   VK_FROM_HANDLE(wrapper_device, device, _device);
-   const struct vk_device_dispatch_table *dt = &device->dispatch_table;
-
-   if (!device->emulate_push_descriptor)
-      return dt->CreateDescriptorSetLayout(device->dispatch_handle,
-                                           pCreateInfo, pAllocator, pSetLayout);
-
-   VkDescriptorSetLayoutCreateInfo ci = *pCreateInfo;
-   bool is_push = (ci.flags &
-      VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR) != 0;
-   if (is_push)
-      ci.flags &= ~VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-
-   VkResult r = dt->CreateDescriptorSetLayout(device->dispatch_handle,
-                                              &ci, pAllocator, pSetLayout);
-   if (r != VK_SUCCESS)
-      return r;
-
-   struct wrapper_push_dsl *rec = calloc(1, sizeof(*rec));
-   if (rec) {
-      rec->is_push = is_push;
-      for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
-         const VkDescriptorSetLayoutBinding *b = &pCreateInfo->pBindings[i];
-         if (b->descriptorCount == 0)
-            continue;
-         uint32_t j;
-         for (j = 0; j < rec->size_count; j++)
-            if (rec->sizes[j].type == b->descriptorType) {
-               rec->sizes[j].descriptorCount += b->descriptorCount;
-               break;
-            }
-         if (j == rec->size_count && rec->size_count < 16) {
-            rec->sizes[j].type = b->descriptorType;
-            rec->sizes[j].descriptorCount = b->descriptorCount;
-            rec->size_count++;
-         }
-      }
-      simple_mtx_lock(&device->push_mutex);
-      _mesa_hash_table_u64_insert(device->push_dsl_table,
-                                  (uint64_t)*pSetLayout, rec);
-      simple_mtx_unlock(&device->push_mutex);
-   }
-   return VK_SUCCESS;
-}
-
-VKAPI_ATTR void VKAPI_CALL
-wrapper_DestroyDescriptorSetLayout(VkDevice _device,
-                                  VkDescriptorSetLayout descriptorSetLayout,
-                                  const VkAllocationCallbacks *pAllocator)
-{
-   VK_FROM_HANDLE(wrapper_device, device, _device);
-   if (device->emulate_push_descriptor && descriptorSetLayout) {
-      simple_mtx_lock(&device->push_mutex);
-      struct wrapper_push_dsl *rec = _mesa_hash_table_u64_search(
-         device->push_dsl_table, (uint64_t)descriptorSetLayout);
-      if (rec) {
-         _mesa_hash_table_u64_remove(device->push_dsl_table,
-                                     (uint64_t)descriptorSetLayout);
-         free(rec);
-      }
-      simple_mtx_unlock(&device->push_mutex);
-   }
-   device->dispatch_table.DestroyDescriptorSetLayout(device->dispatch_handle,
-      descriptorSetLayout, pAllocator);
-}
-
-VKAPI_ATTR VkResult VKAPI_CALL
-wrapper_CreatePipelineLayout(VkDevice _device,
-                            const VkPipelineLayoutCreateInfo *pCreateInfo,
-                            const VkAllocationCallbacks *pAllocator,
-                            VkPipelineLayout *pPipelineLayout)
-{
-   VK_FROM_HANDLE(wrapper_device, device, _device);
-   VkResult r = device->dispatch_table.CreatePipelineLayout(
-      device->dispatch_handle, pCreateInfo, pAllocator, pPipelineLayout);
-   if (r != VK_SUCCESS || !device->emulate_push_descriptor)
-      return r;
-
-   struct wrapper_push_pl *rec = calloc(1, sizeof(*rec));
-   if (rec) {
-      rec->set_layout_count = pCreateInfo->setLayoutCount;
-      if (rec->set_layout_count) {
-         rec->set_layouts = malloc(sizeof(VkDescriptorSetLayout) *
-                                   rec->set_layout_count);
-         if (rec->set_layouts)
-            memcpy(rec->set_layouts, pCreateInfo->pSetLayouts,
-                   sizeof(VkDescriptorSetLayout) * rec->set_layout_count);
-      }
-      simple_mtx_lock(&device->push_mutex);
-      _mesa_hash_table_u64_insert(device->push_pl_table,
-                                  (uint64_t)*pPipelineLayout, rec);
-      simple_mtx_unlock(&device->push_mutex);
-   }
-   return VK_SUCCESS;
-}
-
-VKAPI_ATTR void VKAPI_CALL
-wrapper_DestroyPipelineLayout(VkDevice _device, VkPipelineLayout pipelineLayout,
-                             const VkAllocationCallbacks *pAllocator)
-{
-   VK_FROM_HANDLE(wrapper_device, device, _device);
-   if (device->emulate_push_descriptor && pipelineLayout) {
-      simple_mtx_lock(&device->push_mutex);
-      struct wrapper_push_pl *rec = _mesa_hash_table_u64_search(
-         device->push_pl_table, (uint64_t)pipelineLayout);
-      if (rec) {
-         _mesa_hash_table_u64_remove(device->push_pl_table,
-                                     (uint64_t)pipelineLayout);
-         free(rec->set_layouts);
-         free(rec);
-      }
-      simple_mtx_unlock(&device->push_mutex);
-   }
-   device->dispatch_table.DestroyPipelineLayout(device->dispatch_handle,
-      pipelineLayout, pAllocator);
-}
-
-static VkResult
-wrapper_create_update_template(struct wrapper_device *device,
-   const VkDescriptorUpdateTemplateCreateInfo *pCreateInfo,
-   const VkAllocationCallbacks *pAllocator,
-   VkDescriptorUpdateTemplate *pTemplate)
-{
-   const struct vk_device_dispatch_table *dt = &device->dispatch_table;
-   PFN_vkCreateDescriptorUpdateTemplate create_fn =
-      dt->CreateDescriptorUpdateTemplate ? dt->CreateDescriptorUpdateTemplate
-                                         : dt->CreateDescriptorUpdateTemplateKHR;
-
-   if (!device->emulate_push_descriptor)
-      return create_fn(device->dispatch_handle, pCreateInfo, pAllocator, pTemplate);
-
-   VkDescriptorUpdateTemplateCreateInfo ci = *pCreateInfo;
-   bool is_push =
-      ci.templateType == VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS;
-   if (is_push) {
-      ci.templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET;
-      /* A DESCRIPTOR_SET template needs a concrete set layout: the push set's. */
-      VkDescriptorSetLayout dsl_handle;
-      wrapper_push_resolve(device, ci.pipelineLayout, ci.set, &dsl_handle);
-      ci.descriptorSetLayout = dsl_handle;
-   }
-
-   VkResult r = create_fn(device->dispatch_handle, &ci, pAllocator, pTemplate);
-   if (r != VK_SUCCESS)
-      return r;
-
-   struct wrapper_push_template *rec = calloc(1, sizeof(*rec));
-   if (rec) {
-      rec->is_push = is_push;
-      rec->bind_point = pCreateInfo->pipelineBindPoint;
-      rec->pipeline_layout = pCreateInfo->pipelineLayout;
-      rec->set = pCreateInfo->set;
-      simple_mtx_lock(&device->push_mutex);
-      _mesa_hash_table_u64_insert(device->push_template_table,
-                                  (uint64_t)*pTemplate, rec);
-      simple_mtx_unlock(&device->push_mutex);
-   }
-   return VK_SUCCESS;
-}
-
-VKAPI_ATTR VkResult VKAPI_CALL
-wrapper_CreateDescriptorUpdateTemplate(VkDevice _device,
-   const VkDescriptorUpdateTemplateCreateInfo *pCreateInfo,
-   const VkAllocationCallbacks *pAllocator,
-   VkDescriptorUpdateTemplate *pDescriptorUpdateTemplate)
-{
-   VK_FROM_HANDLE(wrapper_device, device, _device);
-   return wrapper_create_update_template(device, pCreateInfo, pAllocator,
-                                         pDescriptorUpdateTemplate);
-}
-
-static void
-wrapper_destroy_update_template(struct wrapper_device *device,
-   VkDescriptorUpdateTemplate descriptorUpdateTemplate,
-   const VkAllocationCallbacks *pAllocator)
-{
-   const struct vk_device_dispatch_table *dt = &device->dispatch_table;
-   if (device->emulate_push_descriptor && descriptorUpdateTemplate) {
-      simple_mtx_lock(&device->push_mutex);
-      struct wrapper_push_template *rec = _mesa_hash_table_u64_search(
-         device->push_template_table, (uint64_t)descriptorUpdateTemplate);
-      if (rec) {
-         _mesa_hash_table_u64_remove(device->push_template_table,
-                                     (uint64_t)descriptorUpdateTemplate);
-         free(rec);
-      }
-      simple_mtx_unlock(&device->push_mutex);
-   }
-   PFN_vkDestroyDescriptorUpdateTemplate destroy_fn =
-      dt->DestroyDescriptorUpdateTemplate ? dt->DestroyDescriptorUpdateTemplate
-                                          : dt->DestroyDescriptorUpdateTemplateKHR;
-   destroy_fn(device->dispatch_handle, descriptorUpdateTemplate, pAllocator);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-wrapper_DestroyDescriptorUpdateTemplate(VkDevice _device,
-   VkDescriptorUpdateTemplate descriptorUpdateTemplate,
-   const VkAllocationCallbacks *pAllocator)
-{
-   VK_FROM_HANDLE(wrapper_device, device, _device);
-   wrapper_destroy_update_template(device, descriptorUpdateTemplate, pAllocator);
-}
-
-VKAPI_ATTR VkResult VKAPI_CALL
-wrapper_BeginCommandBuffer(VkCommandBuffer commandBuffer,
-                          const VkCommandBufferBeginInfo *pBeginInfo)
-{
-   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
-   if (wcb->device->emulate_push_descriptor)
-      wrapper_push_pool_reset_all(wcb);
-   return wcb->device->dispatch_table.BeginCommandBuffer(wcb->dispatch_handle,
-                                                         pBeginInfo);
-}
-
-VKAPI_ATTR VkResult VKAPI_CALL
-wrapper_ResetCommandBuffer(VkCommandBuffer commandBuffer,
-                          VkCommandBufferResetFlags flags)
-{
-   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
-   if (wcb->device->emulate_push_descriptor)
-      wrapper_push_pool_reset_all(wcb);
-   return wcb->device->dispatch_table.ResetCommandBuffer(wcb->dispatch_handle,
-                                                         flags);
-}
-
-VKAPI_ATTR VkResult VKAPI_CALL
-wrapper_ResetCommandPool(VkDevice _device, VkCommandPool commandPool,
-                        VkCommandPoolResetFlags flags)
-{
-   VK_FROM_HANDLE(wrapper_device, device, _device);
-   if (device->emulate_push_descriptor) {
-      simple_mtx_lock(&device->resource_mutex);
-      list_for_each_entry(struct wrapper_command_buffer, wcb,
-                          &device->command_buffer_list, link)
-         if (wcb->pool == commandPool)
-            wrapper_push_pool_reset_all(wcb);
-      simple_mtx_unlock(&device->resource_mutex);
-   }
-   return device->dispatch_table.ResetCommandPool(device->dispatch_handle,
-                                                  commandPool, flags);
 }
 
 static const char *
@@ -2435,9 +1608,6 @@ wrapper_command_buffer_destroy(struct wrapper_device *device,
    if (wcb == NULL)
       return;
 
-   if (device->emulate_push_descriptor)
-      wrapper_push_pool_destroy_all(wcb);
-
    device->dispatch_table.FreeCommandBuffers(
       device->dispatch_handle, wcb->pool, 1, &wcb->dispatch_handle);
 
@@ -2487,48 +1657,6 @@ wrapper_AllocateCommandBuffers(VkDevice _device,
    simple_mtx_unlock(&device->resource_mutex);
 
    return result;
-}
-
-VKAPI_ATTR void VKAPI_CALL 
-wrapper_CmdBlitImage(
-    VkCommandBuffer commandBuffer,
-    VkImage srcImage, VkImageLayout srcImageLayout,
-    VkImage dstImage, VkImageLayout dstImageLayout,
-    uint32_t regionCount, const VkImageBlit* pRegions,
-    VkFilter filter)
-{
-   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
-   struct wrapper_device *device = wcb->device;
-   struct wrapper_image *dst_img = get_wrapper_image_from_handle(device, dstImage);
-   const VkImageBlit *regions = (const VkImageBlit *)pRegions;
-
-   if (dst_img && dst_img->is_emulated_bgra8) {
-      WRAPPER_LOG(error, "vkCmdBlitImage with is_emulated_bgra8 image");
-   }
-
-   device->dispatch_table.CmdBlitImage(
-      wcb->dispatch_handle,
-      srcImage, srcImageLayout,
-      dstImage, dstImageLayout,
-      regionCount, regions, filter);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-wrapper_CmdBlitImage2(
-    VkCommandBuffer commandBuffer,
-    const VkBlitImageInfo2 *pBlitImageInfo)
-{
-   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
-   struct wrapper_device *device = wcb->device;
-   struct wrapper_image *dst_img = get_wrapper_image_from_handle(device, pBlitImageInfo->dstImage);
-
-   if (dst_img && dst_img->is_emulated_bgra8) {
-      WRAPPER_LOG(error, "vkCmdBlitImage2 with is_emulated_bgra8 image");
-   }
-
-   if (device->dispatch_table.CmdBlitImage2) {
-      device->dispatch_table.CmdBlitImage2(wcb->dispatch_handle, pBlitImageInfo);
-   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2601,24 +1729,8 @@ wrapper_DestroyDevice(VkDevice _device, const VkAllocationCallbacks* pAllocator)
    }
    if (device->dispatch_handle != VK_NULL_HANDLE) {
       wrapper_pcache_destroy(device);
-      wrapper_destroy_null_resources(device);
       device->dispatch_table.DestroyDevice(device->
          dispatch_handle, pAllocator);
-   }
-   if (device->emulate_push_descriptor) {
-      hash_table_u64_foreach(device->push_dsl_table, e)
-         free(e.data);
-      hash_table_u64_foreach(device->push_pl_table, e) {
-         struct wrapper_push_pl *r = e.data;
-         free(r->set_layouts);
-         free(r);
-      }
-      hash_table_u64_foreach(device->push_template_table, e)
-         free(e.data);
-      _mesa_hash_table_u64_destroy(device->push_dsl_table);
-      _mesa_hash_table_u64_destroy(device->push_pl_table);
-      _mesa_hash_table_u64_destroy(device->push_template_table);
-      simple_mtx_destroy(&device->push_mutex);
    }
    _mesa_hash_table_u64_destroy(device->image_table);
    _mesa_hash_table_u64_destroy(device->buffer_table);

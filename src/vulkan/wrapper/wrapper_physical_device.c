@@ -85,7 +85,7 @@ wrapper_setup_device_extensions(struct wrapper_physical_device *pdevice) {
       return result;
    }
 
-   *exts = wrapper_device_extensions;
+   *exts = wrapper_wsi_extensions;
 
    for (uint32_t i = 0; i < pdevice_extension_count; i++) {
       int idx;
@@ -155,7 +155,6 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
    struct wrapper_instance *instance = (struct wrapper_instance *)_instance;
    VkPhysicalDevice *physical_devices;
    uint32_t physical_device_count = 0;
-   static int wrapper_disable_placed = -1;
    static int wrapper_disable_present_wait = -1;
    VkResult result;
 
@@ -251,9 +250,6 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
                                pdevice->properties2.properties.deviceID);
       wrapper_drm_init(&pdevice->drm);
 
-      if (wrapper_disable_placed == -1)
-         wrapper_disable_placed = getenv("WRAPPER_DISABLE_PLACED") ? atoi(getenv("WRAPPER_DISABLE_PLACED")) : 0;
-
       if (wrapper_disable_present_wait == -1)
          wrapper_disable_present_wait = getenv("WRAPPER_DISABLE_PRESENT_WAIT") && atoi(getenv("WRAPPER_DISABLE_PRESENT_WAIT"));
 
@@ -275,18 +271,8 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
       supported_features->multiViewport = true;
       supported_features->depthClamp = true;
       supported_features->depthBiasClamp = true;
-      if (!wrapper_disable_placed) {
-        pdevice->vk.supported_extensions.EXT_map_memory_placed = true;
-        pdevice->vk.supported_extensions.KHR_map_memory2 = true;
-      	supported_features->memoryMapPlaced = true;
-      	supported_features->memoryUnmapReserve = true;
-      } else {
-        WRAPPER_LOG(info, "Disabling VK_EXT_map_memory_placed");
-      	pdevice->vk.supported_extensions.EXT_map_memory_placed = false;
-        pdevice->vk.supported_extensions.KHR_map_memory2 = false;
-      	supported_features->memoryMapPlaced = false;
-      	supported_features->memoryUnmapReserve = false;
-      }
+      /* VK_EXT_map_memory_placed and its feature bits are not synthesized.
+       * They are exposed only if the underlying Mali driver enumerates them. */
       /* textureCompressionBC is reported exactly as the Mali driver reports it */
       supported_features->fillModeNonSolid = true;
       supported_features->shaderClipDistance = true;

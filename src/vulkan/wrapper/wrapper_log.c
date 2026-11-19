@@ -1,5 +1,11 @@
 #include <time.h>
 #include <errno.h>
+#include <link.h>
+#include <dlfcn.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <unwind.h>
+#include <pthread.h>
 
 #include "wrapper_log.h"
 #include "wrapper_util.h"
@@ -213,4 +219,138 @@ wrapper_debug_utils_messenger(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeve
    }
 
    return 0;
+}
+
+
+/* ------------------------------------------------------------ crash logger */
+
+static struct sigaction crash_old[NSIG];
+static uintptr_t crash_lo, crash_hi;       /* address range of this library */
+static volatile int crash_busy;
+
+static int
+crash_phdr_cb(struct dl_phdr_info *info, size_t size, void *data)
+{
+   uintptr_t addr = (uintptr_t)data;
+   uintptr_t lo = (uintptr_t)-1, hi = 0;
+   bool contains = false;
+
+   (void)size;
+   for (int i = 0; i < info->dlpi_phnum; i++) {
+      const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+      if (ph->p_type != PT_LOAD)
+         continue;
+      uintptr_t a = info->dlpi_addr + ph->p_vaddr;
+      uintptr_t b = a + ph->p_memsz;
+      if (a < lo) lo = a;
+      if (b > hi) hi = b;
+      if (addr >= a && addr < b)
+         contains = true;
+   }
+   if (!contains)
+      return 0;
+   crash_lo = lo;
+   crash_hi = hi;
+   return 1;
+}
+
+struct crash_bt {
+   int n;
+};
+
+static _Unwind_Reason_Code
+crash_bt_cb(struct _Unwind_Context *ctx, void *arg)
+{
+   struct crash_bt *st = arg;
+   uintptr_t pc = _Unwind_GetIP(ctx);
+   Dl_info info;
+
+   if (st->n >= 40)
+      return _URC_END_OF_STACK;
+   if (pc && dladdr((void *)pc, &info) && info.dli_fname)
+      write_to_logfile("  #%02d pc %p %s+0x%lx (%s)", "error", st->n, (void *)pc,
+                       info.dli_fname, (unsigned long)(pc - (uintptr_t)info.dli_fbase),
+                       info.dli_sname ? info.dli_sname : "?");
+   else
+      write_to_logfile("  #%02d pc %p", "error", st->n, (void *)pc);
+   st->n++;
+   return _URC_NO_REASON;
+}
+
+static void
+crash_describe(const char *what, uintptr_t addr)
+{
+   Dl_info info;
+
+   if (addr && dladdr((void *)addr, &info) && info.dli_fname)
+      write_to_logfile("  %s %p = %s+0x%lx (%s)", "error", what, (void *)addr, info.dli_fname,
+                       (unsigned long)(addr - (uintptr_t)info.dli_fbase),
+                       info.dli_sname ? info.dli_sname : "?");
+   else
+      write_to_logfile("  %s %p", "error", what, (void *)addr);
+}
+
+static void
+crash_handler(int sig, siginfo_t *si, void *uc)
+{
+   uintptr_t pc = 0, lr = 0, fault = si ? (uintptr_t)si->si_addr : 0;
+
+#if defined(__aarch64__)
+   pc = ((ucontext_t *)uc)->uc_mcontext.pc;
+   lr = ((ucontext_t *)uc)->uc_mcontext.regs[30];
+#elif defined(__x86_64__)
+   pc = ((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP];
+#endif
+
+   /* Wine and the emulator fault on purpose all the time (guard pages, code
+    * invalidation); only report faults that look like a real bug: a NULL
+    * dereference / jump through NULL, or a fault inside this library. */
+   if (!crash_busy && (fault < 0x10000 || pc < 0x1000 || (pc >= crash_lo && pc < crash_hi))) {
+      struct crash_bt st = { 0 };
+
+      crash_busy = 1;
+      write_to_logfile("CRASH: signal %d, fault address %p", "error", sig, (void *)fault);
+      crash_describe("pc", pc);
+      crash_describe("lr", lr);
+      _Unwind_Backtrace(crash_bt_cb, &st);
+      crash_busy = 0;
+   }
+
+   /* the handler that was there before us (Wine, debuggerd, the emulator) */
+   const struct sigaction *old = &crash_old[sig];
+   if (old->sa_flags & SA_SIGINFO) {
+      old->sa_sigaction(sig, si, uc);
+   } else if (old->sa_handler == SIG_DFL) {
+      signal(sig, SIG_DFL);
+   } else if (old->sa_handler != SIG_IGN) {
+      old->sa_handler(sig);
+   }
+}
+
+static void
+crash_install(void)
+{
+   static const int signals[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE };
+   struct sigaction sa;
+   const char *env = getenv("WRAPPER_CRASH_LOG");
+
+   if (env && !atoi(env))
+      return;
+
+   dl_iterate_phdr(crash_phdr_cb, (void *)(uintptr_t)&crash_install);
+
+   memset(&sa, 0, sizeof(sa));
+   sa.sa_sigaction = crash_handler;
+   sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+   sigemptyset(&sa.sa_mask);
+   for (unsigned i = 0; i < sizeof(signals) / sizeof(signals[0]); i++)
+      sigaction(signals[i], &sa, &crash_old[signals[i]]);
+}
+
+void
+wrapper_crash_log_init(void)
+{
+   static pthread_once_t once = PTHREAD_ONCE_INIT;
+
+   pthread_once(&once, crash_install);
 }

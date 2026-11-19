@@ -755,6 +755,19 @@ wrapper_add_wsi_extensions(const struct wrapper_physical_device *pdevice,
       wrapper_ext_add(exts, count, WRAPPER_WSI_AHB_NAME);
 }
 
+/* One line telling which driver entry points the WSI layer needs exist. */
+static void
+wrapper_log_wsi_entrypoints(const struct wrapper_device *device)
+{
+#define WSI_EP(n) (device->dispatch_table.n ? #n "=ok" : #n "=MISSING")
+   WRAPPER_LOG(info, "WSI driver entry points: %s %s %s %s %s %s %s",
+               WSI_EP(GetMemoryFdKHR), WSI_EP(GetMemoryFdPropertiesKHR),
+               WSI_EP(GetSemaphoreFdKHR), WSI_EP(ImportSemaphoreFdKHR),
+               WSI_EP(GetFenceFdKHR), WSI_EP(ImportFenceFdKHR),
+               WSI_EP(GetImageDrmFormatModifierPropertiesEXT));
+#undef WSI_EP
+}
+
 /* Is VK_EXT_depth_clip_enable (extension + feature) part of this create info? */
 static bool
 wrapper_create_info_has_depth_clip(const VkDeviceCreateInfo *ci)
@@ -1078,6 +1091,8 @@ if (pdf2 && pdf2->features.f) { \
       physical_device->instance->dispatch_handle, "vkGetDeviceProcAddr");
    vk_device_dispatch_table_load(&device->dispatch_table, gdpa,
                                  device->dispatch_handle);
+
+   wrapper_log_wsi_entrypoints(device);
 
    /* Only the attempts that keep the wrapper's feature chain carry the
     * deviceFault feature struct. */

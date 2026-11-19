@@ -49,12 +49,22 @@ wrapper_emu_init_physical(struct wrapper_physical_device *pdevice)
    struct vk_features *sup = &pdevice->vk.supported_features;
    struct wrapper_emu *emu = &pdevice->emu;
    const char *env = getenv("WRAPPER_FEATURE_EMULATION");
+   const char *compat = getenv("WRAPPER_COMPAT_FEATURES");
 
    memset(emu, 0, sizeof(*emu));
 
+   /* what the GPU really has, so a log tells why something is (not) available */
+   WRAPPER_LOG(info, "Driver features: clip=%d cull=%d depthClamp=%d depthBiasClamp=%d fillModeNonSolid=%d multiViewport=%d | geometry=%d tessellation=%d viewportIndexOut=%d viewportIndexExt=%d | multiDrawIndirect=%d drawIndirectFirstInstance=%d imageGatherExtended=%d",
+               base->shaderClipDistance, base->shaderCullDistance, base->depthClamp,
+               base->depthBiasClamp, base->fillModeNonSolid, base->multiViewport,
+               base->geometryShader, base->tessellationShader,
+               base->shaderOutputViewportIndex, ext->EXT_shader_viewport_index_layer,
+               base->multiDrawIndirect, base->drawIndirectFirstInstance,
+               base->shaderImageGatherExtended);
+
    /* WRAPPER_FEATURE_EMULATION=0: report exactly what the driver reports */
    if (env && !atoi(env))
-      return;
+      goto compat;
 
    if (!base->shaderClipDistance) {
       emu->clip_distance = true;
@@ -80,6 +90,27 @@ wrapper_emu_init_physical(struct wrapper_physical_device *pdevice)
                emu->multi_viewport ? "emulated" : (base->multiViewport ? "native" : "off"));
    WRAPPER_LOG(info, "Not emulatable, as reported by the driver: shaderCullDistance=%d fillModeNonSolid=%d depthBiasClamp=%d",
                base->shaderCullDistance, base->fillModeNonSolid, base->depthBiasClamp);
+
+compat:
+   /*
+    * WRAPPER_COMPAT_FEATURES=1 -- the old behavior, OFF by default: report the
+    * six features as supported although the GPU lacks them and nothing
+    * implements them. DXVK's D3D11 front end refuses every feature level
+    * unless they are reported (D3D9 does not care); the driver never sees the
+    * features it lacks (wrapper_CreateDevice strips them), so a game that
+    * really uses one renders wrong. It exists only to get D3D11 started.
+    */
+   if (compat && atoi(compat)) {
+      #define COMPAT(f) do { if (!sup->f) { sup->f = true; \
+         WRAPPER_LOG(info, "WRAPPER_COMPAT_FEATURES: reporting " #f " although it is not implemented"); } } while (0)
+      COMPAT(shaderClipDistance);
+      COMPAT(shaderCullDistance);
+      COMPAT(depthClamp);
+      COMPAT(depthBiasClamp);
+      COMPAT(fillModeNonSolid);
+      COMPAT(multiViewport);
+      #undef COMPAT
+   }
 }
 
 void

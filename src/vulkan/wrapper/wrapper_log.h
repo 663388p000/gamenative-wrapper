@@ -29,6 +29,13 @@ extern "C" {
 void
 init_wrapper_logging(void);
 
+/* Logs the faulting address/pc/lr (and a backtrace) of a crash inside the
+ * wrapper or the driver to the wrapper log, then hands the signal on to the
+ * handler that was installed before (Wine, debuggerd). WRAPPER_CRASH_LOG=0
+ * turns it off. */
+void
+wrapper_crash_log_init(void);
+
 void                                                                         
 dump_shader_code(const uint32_t *code, size_t size);
 

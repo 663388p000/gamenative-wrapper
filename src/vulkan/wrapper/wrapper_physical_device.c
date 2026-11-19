@@ -293,10 +293,16 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
       supported_features->swapchainMaintenance1 = true;
       supported_features->imageCompressionControlSwapchain = false;
       
+      /* WRAPPER_WSI_SW=1: present through shared memory / put-image instead of
+       * dma-buf (slower, but needs nothing from the driver's external memory) */
       result = wsi_device_init(&pdevice->wsi_device,
                                wrapper_physical_device_to_handle(pdevice),
                                wrapper_wsi_proc_addr, &_instance->alloc, -1,
-                               NULL, &(struct wsi_device_options){});
+                               NULL,
+                               &(struct wsi_device_options){
+                                  .sw_device = getenv("WRAPPER_WSI_SW") &&
+                                               atoi(getenv("WRAPPER_WSI_SW")),
+                               });
       if (result != VK_SUCCESS) {
          vk_physical_device_finish(&pdevice->vk);
          vk_free(&_instance->alloc, pdevice);

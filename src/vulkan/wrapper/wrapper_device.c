@@ -652,6 +652,109 @@ wrapper_emit_diag(struct wrapper_physical_device *pdev,
 #undef D
 }
 
+/*
+ * Extensions the wrapper's own WSI layer needs ENABLED on the driver device.
+ *
+ * Mesa's WSI exports swapchain images as dma-buf and synchronises through fds.
+ * The application never asks for any of that (DXVK/Wine only know
+ * VK_KHR_swapchain), but without these extensions the driver's entry points do
+ * not exist / the handle types are invalid and vkCreateSwapchainKHR dies inside
+ * the driver. They are requested only when the application enabled
+ * VK_KHR_swapchain, only if the driver itself lists them, and in tiers: if the
+ * driver refuses the device the heaviest tier is dropped first (see
+ * wrapper_CreateDevice).
+ *
+ * WRAPPER_WSI_EXTENSIONS = none | auto (default: base + dmabuf) | list of
+ * dmabuf, ahb   (ahb = VK_ANDROID_external_memory_android_hardware_buffer)
+ */
+enum {
+   WRAPPER_WSI_BASE   = 1,
+   WRAPPER_WSI_DMABUF = 2,
+   WRAPPER_WSI_AHB    = 4,
+};
+
+static const char *const wrapper_wsi_base_names[] = {
+   "VK_KHR_external_memory",
+   "VK_KHR_external_memory_fd",
+   "VK_KHR_external_semaphore",
+   "VK_KHR_external_semaphore_fd",
+   "VK_KHR_external_fence",
+   "VK_KHR_external_fence_fd",
+   "VK_EXT_queue_family_foreign",
+};
+#define WRAPPER_WSI_DMABUF_NAME "VK_EXT_external_memory_dma_buf"
+#define WRAPPER_WSI_AHB_NAME "VK_ANDROID_external_memory_android_hardware_buffer"
+
+static bool
+wrapper_driver_lists(const struct wrapper_physical_device *pdevice, const char *name)
+{
+   for (int idx = 0; idx < VK_DEVICE_EXTENSION_COUNT; idx++) {
+      if (strcmp(name, vk_device_extensions[idx].extensionName) == 0)
+         return pdevice->base_supported_extensions.extensions[idx];
+   }
+   return false;
+}
+
+/* Which WSI extension groups the driver offers at all. */
+static unsigned
+wrapper_wsi_available(const struct wrapper_physical_device *pdevice)
+{
+   unsigned mask = 0;
+
+   for (unsigned i = 0; i < ARRAY_SIZE(wrapper_wsi_base_names); i++) {
+      if (wrapper_driver_lists(pdevice, wrapper_wsi_base_names[i]))
+         mask |= WRAPPER_WSI_BASE;
+   }
+   if (wrapper_driver_lists(pdevice, WRAPPER_WSI_DMABUF_NAME))
+      mask |= WRAPPER_WSI_DMABUF;
+   if (wrapper_driver_lists(pdevice, WRAPPER_WSI_AHB_NAME))
+      mask |= WRAPPER_WSI_AHB;
+   return mask;
+}
+
+/* What the user wants out of the available groups. */
+static unsigned
+wrapper_wsi_wanted(void)
+{
+   const char *env = getenv("WRAPPER_WSI_EXTENSIONS");
+   unsigned mask = WRAPPER_WSI_BASE | WRAPPER_WSI_DMABUF;
+   char *list, *save = NULL;
+
+   if (!env || !env[0] || strcmp(env, "auto") == 0)
+      return mask;
+   if (strcmp(env, "none") == 0)
+      return 0;
+
+   list = strdup(env);
+   if (!list)
+      return mask;
+   mask = WRAPPER_WSI_BASE;
+   for (char *t = strtok_r(list, ", ", &save); t; t = strtok_r(NULL, ", ", &save)) {
+      if (strcmp(t, "dmabuf") == 0)
+         mask |= WRAPPER_WSI_DMABUF;
+      else if (strcmp(t, "ahb") == 0)
+         mask |= WRAPPER_WSI_AHB;
+   }
+   free(list);
+   return mask;
+}
+
+static void
+wrapper_add_wsi_extensions(const struct wrapper_physical_device *pdevice,
+                           unsigned mask, uint32_t *count, const char **exts)
+{
+   if (mask & WRAPPER_WSI_BASE) {
+      for (unsigned i = 0; i < ARRAY_SIZE(wrapper_wsi_base_names); i++) {
+         if (wrapper_driver_lists(pdevice, wrapper_wsi_base_names[i]))
+            wrapper_ext_add(exts, count, wrapper_wsi_base_names[i]);
+      }
+   }
+   if ((mask & WRAPPER_WSI_DMABUF) && wrapper_driver_lists(pdevice, WRAPPER_WSI_DMABUF_NAME))
+      wrapper_ext_add(exts, count, WRAPPER_WSI_DMABUF_NAME);
+   if ((mask & WRAPPER_WSI_AHB) && wrapper_driver_lists(pdevice, WRAPPER_WSI_AHB_NAME))
+      wrapper_ext_add(exts, count, WRAPPER_WSI_AHB_NAME);
+}
+
 /* Is VK_EXT_depth_clip_enable (extension + feature) part of this create info? */
 static bool
 wrapper_create_info_has_depth_clip(const VkDeviceCreateInfo *ci)
@@ -678,6 +781,8 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    const char *app_extensions[VK_DEVICE_EXTENSION_COUNT];
    /* ... plus what the wrapper adds on top (Valhall set, explicit opt-ins) */
    const char *wrapper_enable_extensions[VK_DEVICE_EXTENSION_COUNT];
+   /* the list of the attempt being tried: base + WSI tier */
+   const char *attempt_extensions[VK_DEVICE_EXTENSION_COUNT];
    uint32_t app_extension_count = 0;
    uint32_t wrapper_enable_extension_count = 0;
    VkDeviceCreateInfo wrapper_create_info = *pCreateInfo;
@@ -867,51 +972,87 @@ if (pdf2 && pdf2->features.f) { \
       wrapper_create_info.pNext = &fault_features_ext;
    }
 
-   if (WRAPPER_LOG_LEVEL(info)) {
-      for (uint32_t i = 0; i < wrapper_enable_extension_count; i++) {
-         WRAPPER_LOG(info, "Enabling device extension %s", wrapper_enable_extensions[i]);
-      }
-   }
-
    if (wrapper_safe_create_device == -1) {
       wrapper_safe_create_device = getenv("WRAPPER_SAFE_CREATE_DEVICE") ? atoi(getenv("WRAPPER_SAFE_CREATE_DEVICE")) : 1;
    }
 
-   /* Attempt 2 only makes sense if the wrapper really added something. */
+   /* The chain with everything the wrapper spliced in: attempts 1..n_wsi */
+   const void *full_chain = wrapper_create_info.pNext;
+
+   /* WSI extension tiers, heaviest first: [base+dmabuf+ahb] -> [base+dmabuf]
+    * -> [base]; only when the application presents (VK_KHR_swapchain). */
+   unsigned wsi_masks[3];
+   unsigned n_wsi = 0;
+   {
+      unsigned top = device->vk.enabled_extensions.KHR_swapchain ?
+         (wrapper_wsi_wanted() & wrapper_wsi_available(physical_device)) : 0;
+
+      if (!top) {
+         wsi_masks[n_wsi++] = 0;
+      } else {
+         wsi_masks[n_wsi++] = top;
+         if (top & WRAPPER_WSI_AHB)
+            wsi_masks[n_wsi++] = top & ~WRAPPER_WSI_AHB;
+         if ((top & ~WRAPPER_WSI_BASE) && wsi_masks[n_wsi - 1] != (top & WRAPPER_WSI_BASE))
+            wsi_masks[n_wsi++] = top & WRAPPER_WSI_BASE;
+      }
+   }
+
+   /* The application-only attempt only makes sense if the wrapper added anything. */
    const bool wrapper_added_something =
       wrapper_enable_extension_count != app_extension_count ||
-      wrapper_create_info.pNext != app_chain;
+      full_chain != app_chain || wsi_masks[0] != 0;
+   const unsigned total_attempts = n_wsi + (wrapper_added_something ? 1 : 0) + 1;
+   unsigned attempt;
 
    /*
-    * 1: application list + wrapper additions
-    * 2: only what the application asked for (extensions and feature chain)
-    * 3: only the application's extensions, NULL pNext chain
-    * A failure in 1 is retried in 2 so an extension/feature the wrapper added
-    * can never be the reason a device is refused; 3 is the old last resort.
+    * attempts 1..n_wsi   application list + wrapper additions + WSI tier i
+    * next                only what the application asked for (extensions and
+    *                     feature chain)
+    * last                only the application's extensions, NULL pNext chain
+    * A failure is retried with less, so an extension or feature the wrapper
+    * added can never be the reason a device is refused.
     */
-   for (;;) {
+   for (attempt = 0; ; attempt++) {
+      if (attempt < n_wsi) {
+         uint32_t n = wrapper_enable_extension_count;
+
+         memcpy(attempt_extensions, wrapper_enable_extensions, n * sizeof(attempt_extensions[0]));
+         wrapper_add_wsi_extensions(physical_device, wsi_masks[attempt], &n, attempt_extensions);
+         wrapper_create_info.enabledExtensionCount = n;
+         wrapper_create_info.ppEnabledExtensionNames = attempt_extensions;
+         wrapper_create_info.pNext = full_chain;
+         if (attempt == 0 && WRAPPER_LOG_LEVEL(info)) {
+            for (uint32_t i = 0; i < n; i++)
+               WRAPPER_LOG(info, "Enabling device extension %s", attempt_extensions[i]);
+         } else if (attempt > 0) {
+            WRAPPER_LOG(info, "createDevice attempt %u: WSI extension groups 0x%x (%u extensions)",
+                        attempt + 1, wsi_masks[attempt], n);
+         }
+      } else if (attempt == n_wsi && wrapper_added_something) {
+         wrapper_create_info.enabledExtensionCount = app_extension_count;
+         wrapper_create_info.ppEnabledExtensionNames = app_extensions;
+         wrapper_create_info.pNext = app_chain;
+         WRAPPER_LOG(info, "createDevice attempt %u: only the extensions and features the application requested",
+                     attempt + 1);
+      } else {
+         wrapper_create_info.enabledExtensionCount = app_extension_count;
+         wrapper_create_info.ppEnabledExtensionNames = app_extensions;
+         wrapper_create_info.pNext = NULL;
+         WRAPPER_LOG(info, "createDevice attempt %u: NULL pNext chain", attempt + 1);
+      }
+
       result = physical_device->dispatch_table.CreateDevice(
          physical_device->dispatch_handle, &wrapper_create_info,
          pAllocator, &device->dispatch_handle);
 
-      if (result == VK_SUCCESS || !wrapper_safe_create_device || create_stage >= 3)
+      if (result == VK_SUCCESS || !wrapper_safe_create_device || attempt + 1 >= total_attempts)
          break;
 
+      WRAPPER_LOG(info, "Driver createDevice failed (res %d)", result);
       device->dispatch_handle = VK_NULL_HANDLE;
-      create_stage++;
-      if (create_stage == 2 && !wrapper_added_something)
-         create_stage = 3;
-
-      wrapper_create_info.enabledExtensionCount = app_extension_count;
-      wrapper_create_info.ppEnabledExtensionNames = app_extensions;
-      if (create_stage == 2) {
-         WRAPPER_LOG(info, "Driver createDevice failed (res %d): retrying with only the extensions and features the application requested", result);
-         wrapper_create_info.pNext = app_chain;
-      } else {
-         WRAPPER_LOG(info, "Driver createDevice failed (res %d): forcing device creation with a NULL pNext chain", result);
-         wrapper_create_info.pNext = NULL;
-      }
    }
+   create_stage = attempt + 1;
 
    if (result != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed driver createDevice, res %d", result);
@@ -923,6 +1064,8 @@ if (pdf2 && pdf2->features.f) { \
 
    if (create_stage > 1)
       WRAPPER_LOG(info, "Device created on attempt %u", create_stage);
+   if (create_stage <= n_wsi && wsi_masks[create_stage - 1])
+      WRAPPER_LOG(info, "WSI extension groups enabled on the driver device: 0x%x", wsi_masks[create_stage - 1]);
 
    /* depthClamp emulation needs depth-clip control on the device that really
     * got created (a fallback attempt may have dropped it). */
@@ -936,9 +1079,9 @@ if (pdf2 && pdf2->features.f) { \
    vk_device_dispatch_table_load(&device->dispatch_table, gdpa,
                                  device->dispatch_handle);
 
-   /* Only the first attempt carries the deviceFault feature struct, so fault
-    * reporting is usable only when that one succeeded. */
-   device->device_fault_enabled = enable_device_fault && create_stage == 1;
+   /* Only the attempts that keep the wrapper's feature chain carry the
+    * deviceFault feature struct. */
+   device->device_fault_enabled = enable_device_fault && create_stage <= n_wsi;
 
    /* Persistent pipeline cache (Mali compiles are slow): see wrapper_pipeline_cache.c */
    wrapper_pcache_create(device);

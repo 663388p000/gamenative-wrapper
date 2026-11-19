@@ -107,6 +107,7 @@ static void init_debug_messenger(VkInstance instance)
 static void *get_vulkan_handle(void)
 {
    init_wrapper_logging();
+   wrapper_crash_log_init();
 
    if (WRAPPER_LOG_LEVEL(validation) || WRAPPER_LOG_LEVEL(apidump)) {
       has_intercepted_layer_paths = set_layer_paths();

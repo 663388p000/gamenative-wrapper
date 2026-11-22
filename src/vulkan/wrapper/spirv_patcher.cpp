@@ -12,11 +12,13 @@ namespace Decoration {
 
    namespace Literals {
       static const uint32_t ClipDistance = 3;
+      static const uint32_t CullDistance = 4;
    }
 }
 
 namespace Capability {
    static const uint32_t ClipDistance = 32;
+   static const uint32_t CullDistance = 33;
 }
 
 namespace OpCode {
@@ -34,8 +36,11 @@ namespace OpType {
 	static const uint32_t OpTypeVector = 23;
 }
 
-void
-remove_ClipDistance(uint32_t *pCode, size_t *codeSize)
+/* Drops `capability` and every `OpDecorate ... BuiltIn <builtin>` of a module
+ * (standalone variables; the block-member form is handled by the lowering in
+ * wrapper_spirv_emu.cpp, this is only the last-resort fallback). */
+static void
+remove_builtin(uint32_t *pCode, size_t *codeSize, uint32_t cap, uint32_t builtin)
 {
    uint32_t offset = 5;
    std::vector<uint32_t> code(pCode, pCode + (*codeSize / sizeof(uint32_t)));
@@ -51,7 +56,7 @@ remove_ClipDistance(uint32_t *pCode, size_t *codeSize)
 
       if (opcode == OpCode::OpCapability && length >= 2) {
          uint32_t capability = code[offset + 1];
-         if (capability == Capability::ClipDistance) {
+         if (capability == cap) {
             instructions.insert({offset, length});
          }
       }
@@ -60,7 +65,7 @@ remove_ClipDistance(uint32_t *pCode, size_t *codeSize)
          uint32_t decoration = code[offset + 2];
          if (decoration == Decoration::Builtin) {
             uint32_t literal = code[offset + 3];
-            if (literal == Decoration::Literals::ClipDistance) {
+            if (literal == builtin) {
                instructions.insert({offset, length});
             }
          }
@@ -75,6 +80,18 @@ remove_ClipDistance(uint32_t *pCode, size_t *codeSize)
    
    *codeSize = sizeof(uint32_t) * code.size();
    memcpy(pCode, code.data(), *codeSize);
+}
+
+void
+remove_ClipDistance(uint32_t *pCode, size_t *codeSize)
+{
+   remove_builtin(pCode, codeSize, Capability::ClipDistance, Decoration::Literals::ClipDistance);
+}
+
+void
+remove_CullDistance(uint32_t *pCode, size_t *codeSize)
+{
+   remove_builtin(pCode, codeSize, Capability::CullDistance, Decoration::Literals::CullDistance);
 }
 
 void 

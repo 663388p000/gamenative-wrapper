@@ -265,14 +265,14 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
       pdevice->base_supported_features = *supported_features;
       /*
        * Only features the wrapper really implements itself are switched on
-       * here: its WSI layer (presentId, ...) and, below, the three features
-       * wrapper_emu.c emulates exactly. multiViewport, depthClamp,
-       * depthBiasClamp, fillModeNonSolid, shaderClipDistance,
-       * shaderCullDistance and textureCompressionBC are otherwise reported
-       * exactly as the Mali driver reports them (copied by
-       * wrapper_setup_device_features() above). An application that needs a
-       * feature that is neither native nor emulated sees
-       * VK_ERROR_FEATURE_NOT_PRESENT instead of a device that renders wrong.
+       * here: its WSI layer (presentId, ...) and, below, whatever
+       * wrapper_emu.c builds for real when the driver lacks it (clip / cull
+       * distance, wireframe and point polygon mode, multi-draw-indirect,
+       * viewport arrays, depth clamp). Everything else -- depthBiasClamp,
+       * textureCompressionBC, ... -- is reported exactly as the Mali driver
+       * reports it (copied by wrapper_setup_device_features() above). An
+       * application that needs a feature that is neither native nor emulated
+       * sees VK_ERROR_FEATURE_NOT_PRESENT instead of a device that renders wrong.
        */
       supported_features->presentId = true;
       /* VK_EXT_map_memory_placed is not implemented by the wrapper any more */
@@ -280,8 +280,8 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
       supported_features->memoryMapRangePlaced = false;
       supported_features->memoryUnmapReserve = false;
 
-      /* shaderClipDistance / depthClamp / multiViewport: emulated only where
-       * the driver lacks them and the emulation is exact (wrapper_emu.c) */
+      /* the driver is asked first (base_supported_features above); what it
+       * lacks and the wrapper can build is built and reported (wrapper_emu.c) */
       wrapper_emu_init_physical(pdevice);
       if (wrapper_disable_present_wait) {
          WRAPPER_LOG(info, "Disabling present wait");
@@ -294,7 +294,8 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
       supported_features->imageCompressionControlSwapchain = false;
       
       /* WRAPPER_WSI_SW=1: present through shared memory / put-image instead of
-       * dma-buf (slower, but needs nothing from the driver's external memory) */
+       * AHardwareBuffer-backed images (slower, but needs nothing from the
+       * driver's external memory) */
       result = wsi_device_init(&pdevice->wsi_device,
                                wrapper_physical_device_to_handle(pdevice),
                                wrapper_wsi_proc_addr, &_instance->alloc, -1,

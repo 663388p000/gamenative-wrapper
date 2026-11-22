@@ -36,25 +36,36 @@ VK_DEFINE_HANDLE_CASTS(wrapper_instance, vk.base, VkInstance,
                        VK_OBJECT_TYPE_INSTANCE)
 
 /*
- * Which of the "big" core features are emulated by the wrapper (wrapper_emu.c)
- * because the Mali driver does not report them. A feature the driver reports
- * is never emulated: it is passed through untouched. A feature that is neither
- * native nor emulated stays off.
+ * Which core features the wrapper implements itself (wrapper_emu.c) because the
+ * Mali driver does not report them. The driver is asked first: a feature it
+ * reports is never emulated, it is passed through untouched. A feature that is
+ * neither native nor emulated stays off -- nothing is ever reported that
+ * nothing backs.
  *
- *   shaderClipDistance  emulated by lowering ClipDistance to a varying and
- *                       discarding in the fragment shader (wrapper_spirv_emu.cpp)
- *   depthClamp          emulated with VK_EXT_depth_clip_enable (clip off == clamp)
- *   multiViewport       emulated by mapping every viewport/scissor array to
- *                       element 0 -- exact, because without geometry shaders or
- *                       viewport-index shader outputs no shader can pick another one
- *
- * shaderCullDistance, fillModeNonSolid and depthBiasClamp can not be emulated
- * by a layer on top of a closed driver, so they are exactly what the driver says.
+ *   clip_distance        ClipDistance lowered to a varying + discard in the
+ *                        fragment shader (wrapper_spirv_emu.cpp)
+ *   cull_distance        CullDistance lowered to a varying; a geometry shader
+ *                        built from the vertex shader's outputs drops the
+ *                        primitive when every vertex is negative for a plane
+ *   fill_mode            polygonMode LINE / POINT drawn by the same geometry
+ *                        shader (triangle -> edges / corners)
+ *   depth_clamp          VK_EXT_depth_clip_enable (clip off == clamp); only
+ *                        when the driver has no depthClamp itself
+ *   multi_viewport       viewport/scissor arrays accepted, element 0 is the one
+ *                        the hardware uses
+ *   multi_draw_indirect  drawCount > 1 split into single indirect draws
+ *   viewport_index_layer VK_EXT_shader_viewport_index_layer advertised on top
+ *                        of the Vulkan 1.2 shaderOutputViewportIndex/Layer
+ *                        features, SPIR-V capability translated
  */
 struct wrapper_emu {
    bool clip_distance;
+   bool cull_distance;
+   bool fill_mode;
    bool depth_clamp;
    bool multi_viewport;
+   bool multi_draw_indirect;
+   bool viewport_index_layer;
 };
 
 struct wrapper_physical_device {
@@ -94,10 +105,6 @@ struct wrapper_device {
    simple_mtx_t resource_mutex;
    struct list_head command_buffer_list;
    struct list_head device_memory_list;
-   struct list_head buffer_list;
-   struct list_head image_list;
-   struct hash_table_u64 *buffer_table;
-   struct hash_table_u64 *image_table;
    struct hash_table_u64 *memory_table;   /* VkDeviceMemory -> wrapper_device_memory (AHB imports only) */
    uint32_t ahb_memory_count;             /* entries in memory_table (atomic) */
    struct wrapper_physical_device *physical;
@@ -108,6 +115,10 @@ struct wrapper_device {
    /* feature emulation (wrapper_emu.c) */
    struct wrapper_emu emu;
    bool emu_depth_clip;                    /* VK_EXT_depth_clip_enable is enabled on the driver device */
+   bool emu_gs;                            /* geometryShader is enabled on the driver device (cull / wireframe) */
+   bool emu_gs_point_size;                 /* ... and a geometry shader may write PointSize */
+   bool wsi_ahb;                           /* swapchain images are exported as AHardwareBuffer (no dma-buf) */
+   simple_mtx_t shader_mutex;              /* guards shader_table / shader_list */
    struct hash_table_u64 *shader_table;    /* VkShaderModule -> wrapper_emu_shader (only if emu needs SPIR-V) */
    struct list_head shader_list;           /* the same entries, for teardown */
 
@@ -117,45 +128,6 @@ struct wrapper_device {
 
 VK_DEFINE_HANDLE_CASTS(wrapper_device, vk.base, VkDevice,
                        VK_OBJECT_TYPE_DEVICE)
-
-struct wrapper_buffer {
-   struct vk_buffer vk;
-
-   struct wrapper_device *device;
-   struct list_head link;
-   VkBuffer dispatch_handle;
-   VkDeviceSize size;
-   VkExternalMemoryHandleTypeFlags handle_types;
-};
-
-struct wrapper_buffer *
-get_wrapper_buffer_from_handle_locked(struct wrapper_device *device, VkBuffer buffer);
-
-struct wrapper_buffer *
-get_wrapper_buffer_from_handle(struct wrapper_device *device, VkBuffer buffer);
-
-#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EMULATED_B8G8R8A8_CREATE_INFO_EXT 1000701234
-typedef struct VkEmulatedB8G8R8A8CreateInfoExt {
-    VkStructureType          sType;
-    const void*              pNext;
-} VkEmulatedB8G8R8A8CreateInfoExt;
-
-struct wrapper_image {
-   struct vk_image vk;
-
-   struct wrapper_device *device;
-   struct list_head link;
-   VkImage dispatch_handle;
-
-   bool is_wsi_image;
-   VkExternalMemoryHandleTypeFlags handle_types;
-};
-
-struct wrapper_image *
-get_wrapper_image_from_handle_locked(struct wrapper_device *device, VkImage image);
-
-struct wrapper_image *
-get_wrapper_image_from_handle(struct wrapper_device *device, VkImage image);
 
 struct wrapper_command_buffer {
    struct vk_command_buffer vk;
@@ -234,6 +206,12 @@ wrapper_emu_rewrite_graphics(struct wrapper_device *device, uint32_t count,
                              struct wrapper_emu_rewrite *rw);
 void wrapper_emu_rewrite_free(struct wrapper_device *device,
                               struct wrapper_emu_rewrite *rw);
+
+/* SPIR-V changes every module bound for the driver needs (drops what the GPU
+ * can not compile, translates SPV_EXT_shader_viewport_index_layer, ...).
+ * *words is a malloc'ed writable module that may be shrunk or replaced. */
+void wrapper_emu_fixup_module(const struct wrapper_device *device,
+                              uint32_t **words, size_t *bytes);
 
 /* Applies the driver-specific SPIR-V workarounds (shared with
  * wrapper_CreateShaderModule). */

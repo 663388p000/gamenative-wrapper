@@ -26,6 +26,9 @@ struct wrapper_log {
 extern "C" {
 #endif
 
+/* enabled categories, parsed once from WRAPPER_LOG_LEVEL */
+extern uint64_t wrapper_log_mask;
+
 void
 init_wrapper_logging(void);
 
@@ -55,7 +58,13 @@ wrapper_debug_utils_messenger(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeve
                               const VkDebugUtilsMessengerCallbackDataEXT *callbackData,
                               void *userData);
 
-#define WRAPPER_LOG_LEVEL(s) (get_wrapper_log_level(#s))
+/* a single AND on a global: no string compare on the hot paths */
+#define WRAPPER_LOGFLAG_info       WRAPPER_LOG_INFO
+#define WRAPPER_LOGFLAG_error      WRAPPER_LOG_ERROR
+#define WRAPPER_LOGFLAG_shader     WRAPPER_LOG_SHADER
+#define WRAPPER_LOGFLAG_validation WRAPPER_LOG_VALIDATION
+#define WRAPPER_LOGFLAG_apidump    WRAPPER_LOG_APIDUMP
+#define WRAPPER_LOG_LEVEL(s) ((wrapper_log_mask & WRAPPER_LOGFLAG_##s) != 0)
 
 #define WRAPPER_LOG(level, fmt, ...) \
 do {\

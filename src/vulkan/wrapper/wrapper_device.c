@@ -8,6 +8,7 @@
 #include "wrapper_private.h"
 #include "wrapper_log.h"
 #include "spirv_patcher.hpp"
+#include "wrapper_spirv_emu.h"
 #include "wrapper_entrypoints.h"
 #include "wrapper_trampolines.h"
 #include "vk_alloc.h"
@@ -45,9 +46,14 @@ const struct vk_device_extension_table wrapper_wsi_extensions =
  * VK_EXT_map_memory_placed used to be emulated by the wrapper (fixed-address
  * mapping of exported buffers). That emulation is gone, so the extension is
  * hidden even if a driver lists it: the wrapper does not implement it.
+ * The same goes for the dma-buf / DRM-modifier extensions (see below).
  */
 const struct vk_device_extension_table wrapper_filter_extensions =
 {
+   /* no dma-buf anywhere: swapchain images are AHardwareBuffers, and nothing
+    * that is only about dma-buf / DRM format modifiers is of any use here */
+   .EXT_external_memory_dma_buf = true,
+   .EXT_image_drm_format_modifier = true,
    .EXT_hdr_metadata = true,
    .GOOGLE_display_timing = true,
    .KHR_shared_presentable_image = true,
@@ -149,44 +155,18 @@ wrapper_append_valhall_extensions(const struct wrapper_valhall_plan *plan,
       wrapper_ext_add(exts, count, "VK_KHR_multiview");
 }
 
-inline struct wrapper_buffer *
-get_wrapper_buffer_from_handle_locked(struct wrapper_device *device, VkBuffer buffer) {
-   return _mesa_hash_table_u64_search(device->buffer_table, (uint64_t) buffer);
-}
-
-struct wrapper_buffer *
-get_wrapper_buffer_from_handle(struct wrapper_device *device, VkBuffer buffer) {
-   simple_mtx_lock(&device->resource_mutex);
-   struct wrapper_buffer *wb = get_wrapper_buffer_from_handle_locked(device, buffer);
-   simple_mtx_unlock(&device->resource_mutex);
-
-   return wb;
-}
-
-inline struct wrapper_image *
-get_wrapper_image_from_handle_locked(struct wrapper_device *device, VkImage image) {
-   return _mesa_hash_table_u64_search(device->image_table, (uint64_t) image);
-}
-
-struct wrapper_image *
-get_wrapper_image_from_handle(struct wrapper_device *device, VkImage image) {   
-   simple_mtx_lock(&device->resource_mutex);
-   struct wrapper_image *wi = get_wrapper_image_from_handle_locked(device, image);
-   simple_mtx_unlock(&device->resource_mutex);
-   
-   return wi;
-}
-
 /*
  * The request list handed to the Mali driver: exactly the extensions the
  * application enabled that the driver itself lists. WSI extensions (served by
  * the wrapper) and hidden ones never reach the driver.
  *
- * Nothing is appended on the wrapper's behalf any more -- no external-memory /
- * dma-buf / AHB / buffer-device-address / memory-model / driver-properties
- * extras -- so the driver cannot fail vkCreateDevice over an extension the
- * application never asked for. Extra names can still be requested explicitly
- * with WRAPPER_EXTRA_EXTENSIONS (see below).
+ * Nothing is appended on the wrapper's behalf here -- no buffer-device-address /
+ * memory-model / driver-properties extras -- so the driver cannot fail
+ * vkCreateDevice over an extension the application never asked for. What the
+ * wrapper itself needs is added in tiers that a failing device creation drops
+ * again (WSI: external memory / semaphore / fence + AHardwareBuffer, only with
+ * VK_KHR_swapchain; depth clip control and the Valhall set). Extra names can
+ * still be requested explicitly with WRAPPER_EXTRA_EXTENSIONS (see below).
  */
 static void
 wrapper_collect_app_extensions(const struct wrapper_device *device,
@@ -212,10 +192,10 @@ wrapper_collect_app_extensions(const struct wrapper_device *device,
 }
 
 /*
- * WRAPPER_EXTRA_EXTENSIONS="VK_KHR_external_memory_fd,VK_EXT_external_memory_dma_buf"
+ * WRAPPER_EXTRA_EXTENSIONS="VK_EXT_memory_budget,VK_EXT_memory_priority"
  * asks the driver for extra device extensions on top of the application's
- * list (e.g. when a WSI path needs dma-buf export). Only names the driver
- * really lists are used; anything else is logged and skipped.
+ * list. Only names the driver really lists are used; anything else is logged
+ * and skipped.
  */
 static void
 wrapper_add_env_extensions(const struct wrapper_physical_device *pdevice,
@@ -610,7 +590,11 @@ wrapper_emit_diag(struct wrapper_physical_device *pdev,
          if (pdev->vk.supported_extensions.extensions[i] &&
              !pdev->base_supported_extensions.extensions[i]) {
             D("  %s%s\n", vk_device_extensions[i].extensionName,
-              wrapper_wsi_extensions.extensions[i] ? " (wrapper WSI)" : " (UNEXPECTED: not in driver)");
+              wrapper_wsi_extensions.extensions[i] ? " (wrapper WSI)" :
+              (pdev->emu.viewport_index_layer &&
+               !strcmp(vk_device_extensions[i].extensionName, "VK_EXT_shader_viewport_index_layer"))
+                 ? " (emulated: Vulkan 1.2 shaderOutputViewportIndex/Layer)"
+                 : " (UNEXPECTED: not in driver)");
             not_in_driver++;
          }
       }
@@ -623,8 +607,8 @@ wrapper_emit_diag(struct wrapper_physical_device *pdev,
      pdev->mali.kbase_ok ? "kbase" : "kbase unavailable, device name",
      pdev->mali.l2_cache_bytes / 1024, pdev->mali.l2_line_bytes,
      pdev->mali.l2_slices, pdev->mali.max_threads);
-   D("  memory: plain driver memory (no placed map / DRM / dma-buf emulation); AHB imports keep a wrapper-side reference\n");
-   D("  clip/cull/depthClamp/depthBiasClamp/fillModeNonSolid/multiViewport (driver-native): %d/%d/%d/%d/%d/%d\n",
+   D("  memory: plain driver memory; AHB imports keep a wrapper-side reference; swapchain images are AHardwareBuffers (no dma-buf)\n");
+   D("  clip/cull/depthClamp/depthBiasClamp/fillModeNonSolid/multiViewport (driver-native; the rest is emulated, see 'Features:' in the log): %d/%d/%d/%d/%d/%d\n",
      pdev->base_supported_features.shaderClipDistance,
      pdev->base_supported_features.shaderCullDistance,
      pdev->base_supported_features.depthClamp,
@@ -655,34 +639,36 @@ wrapper_emit_diag(struct wrapper_physical_device *pdev,
 /*
  * Extensions the wrapper's own WSI layer needs ENABLED on the driver device.
  *
- * Mesa's WSI exports swapchain images as dma-buf and synchronises through fds.
- * The application never asks for any of that (DXVK/Wine only know
- * VK_KHR_swapchain), but without these extensions the driver's entry points do
- * not exist / the handle types are invalid and vkCreateSwapchainKHR dies inside
- * the driver. They are requested only when the application enabled
- * VK_KHR_swapchain, only if the driver itself lists them, and in tiers: if the
- * driver refuses the device the heaviest tier is dropped first (see
- * wrapper_CreateDevice).
+ * Mesa's WSI exports every swapchain image and synchronises through fds. The
+ * application never asks for any of that (DXVK/Wine only know VK_KHR_swapchain),
+ * but without these extensions the driver's entry points do not exist / the
+ * handle types are invalid and vkCreateSwapchainKHR dies inside the driver.
  *
- * WRAPPER_WSI_EXTENSIONS = none | auto (default: base + dmabuf) | list of
- * dmabuf, ahb   (ahb = VK_ANDROID_external_memory_android_hardware_buffer)
+ * The images are AHardwareBuffers (VK_ANDROID_external_memory_android_hardware_buffer):
+ * Android's own buffer type, which every Mali driver backs. There is no dma-buf
+ * (VK_EXT_external_memory_dma_buf, DRM modifiers) anywhere in the wrapper: what
+ * WSI asks for as DMA_BUF is translated to AHB in wrapper_device_memory.c, and
+ * the driver is never asked for a handle type it does not list.
+ *
+ * Requested only when the application enabled VK_KHR_swapchain, only if the
+ * driver itself lists them, in tiers: if the driver refuses the device the AHB
+ * tier is dropped first (see wrapper_CreateDevice).
+ *
+ * WRAPPER_WSI_EXTENSIONS = none | auto (default: base + ahb)
  */
 enum {
-   WRAPPER_WSI_BASE   = 1,
-   WRAPPER_WSI_DMABUF = 2,
-   WRAPPER_WSI_AHB    = 4,
+   WRAPPER_WSI_BASE = 1,
+   WRAPPER_WSI_AHB  = 2,
 };
 
 static const char *const wrapper_wsi_base_names[] = {
    "VK_KHR_external_memory",
-   "VK_KHR_external_memory_fd",
    "VK_KHR_external_semaphore",
    "VK_KHR_external_semaphore_fd",
    "VK_KHR_external_fence",
    "VK_KHR_external_fence_fd",
    "VK_EXT_queue_family_foreign",
 };
-#define WRAPPER_WSI_DMABUF_NAME "VK_EXT_external_memory_dma_buf"
 #define WRAPPER_WSI_AHB_NAME "VK_ANDROID_external_memory_android_hardware_buffer"
 
 static bool
@@ -705,8 +691,6 @@ wrapper_wsi_available(const struct wrapper_physical_device *pdevice)
       if (wrapper_driver_lists(pdevice, wrapper_wsi_base_names[i]))
          mask |= WRAPPER_WSI_BASE;
    }
-   if (wrapper_driver_lists(pdevice, WRAPPER_WSI_DMABUF_NAME))
-      mask |= WRAPPER_WSI_DMABUF;
    if (wrapper_driver_lists(pdevice, WRAPPER_WSI_AHB_NAME))
       mask |= WRAPPER_WSI_AHB;
    return mask;
@@ -717,26 +701,10 @@ static unsigned
 wrapper_wsi_wanted(void)
 {
    const char *env = getenv("WRAPPER_WSI_EXTENSIONS");
-   unsigned mask = WRAPPER_WSI_BASE | WRAPPER_WSI_DMABUF;
-   char *list, *save = NULL;
 
-   if (!env || !env[0] || strcmp(env, "auto") == 0)
-      return mask;
-   if (strcmp(env, "none") == 0)
+   if (env && strcmp(env, "none") == 0)
       return 0;
-
-   list = strdup(env);
-   if (!list)
-      return mask;
-   mask = WRAPPER_WSI_BASE;
-   for (char *t = strtok_r(list, ", ", &save); t; t = strtok_r(NULL, ", ", &save)) {
-      if (strcmp(t, "dmabuf") == 0)
-         mask |= WRAPPER_WSI_DMABUF;
-      else if (strcmp(t, "ahb") == 0)
-         mask |= WRAPPER_WSI_AHB;
-   }
-   free(list);
-   return mask;
+   return WRAPPER_WSI_BASE | WRAPPER_WSI_AHB;
 }
 
 static void
@@ -749,8 +717,6 @@ wrapper_add_wsi_extensions(const struct wrapper_physical_device *pdevice,
             wrapper_ext_add(exts, count, wrapper_wsi_base_names[i]);
       }
    }
-   if ((mask & WRAPPER_WSI_DMABUF) && wrapper_driver_lists(pdevice, WRAPPER_WSI_DMABUF_NAME))
-      wrapper_ext_add(exts, count, WRAPPER_WSI_DMABUF_NAME);
    if ((mask & WRAPPER_WSI_AHB) && wrapper_driver_lists(pdevice, WRAPPER_WSI_AHB_NAME))
       wrapper_ext_add(exts, count, WRAPPER_WSI_AHB_NAME);
 }
@@ -760,11 +726,10 @@ static void
 wrapper_log_wsi_entrypoints(const struct wrapper_device *device)
 {
 #define WSI_EP(n) (device->dispatch_table.n ? #n "=ok" : #n "=MISSING")
-   WRAPPER_LOG(info, "WSI driver entry points: %s %s %s %s %s %s %s",
-               WSI_EP(GetMemoryFdKHR), WSI_EP(GetMemoryFdPropertiesKHR),
+   WRAPPER_LOG(info, "WSI driver entry points: %s %s %s %s %s",
+               WSI_EP(GetMemoryAndroidHardwareBufferANDROID),
                WSI_EP(GetSemaphoreFdKHR), WSI_EP(ImportSemaphoreFdKHR),
-               WSI_EP(GetFenceFdKHR), WSI_EP(ImportFenceFdKHR),
-               WSI_EP(GetImageDrmFormatModifierPropertiesEXT));
+               WSI_EP(GetFenceFdKHR), WSI_EP(ImportFenceFdKHR));
 #undef WSI_EP
 }
 
@@ -781,6 +746,87 @@ wrapper_create_info_has_depth_clip(const VkDeviceCreateInfo *ci)
          ext = true;
    }
    return ext && f && f->depthClipEnable;
+}
+
+/*
+ * Feature bits the driver call is made with differ from what the application
+ * wrote: bits for features the GPU lacks are cleared (the wrapper emulates or
+ * refuses them), bits the emulation builds on are set. The application's own
+ * structs are patched for the duration of the driver call and put back right
+ * after it, so nothing of theirs is changed behind their back.
+ */
+struct wrapper_feature_patch {
+   VkBool32 *p;
+   VkBool32 old;
+};
+
+static void
+wrapper_feature_patch(struct wrapper_feature_patch *patches, unsigned *n, unsigned cap,
+                      VkBool32 *p, VkBool32 value)
+{
+   if (*p == value || *n >= cap)
+      return;
+   patches[*n].p = p;
+   patches[*n].old = *p;
+   (*n)++;
+   *p = value;
+}
+
+static void
+wrapper_feature_restore(struct wrapper_feature_patch *patches, unsigned n)
+{
+   while (n--)
+      *patches[n].p = patches[n].old;
+}
+
+/* Vulkan 1.2 features that also have a struct of their own: a chain that has
+ * one of those must not get a VkPhysicalDeviceVulkan12Features next to it. */
+static bool
+wrapper_chain_has_split_v12_features(const void *chain)
+{
+   return vk_find_struct_const(chain, PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES) ||
+          vk_find_struct_const(chain, PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES) ||
+          vk_find_struct_const(chain, PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES) ||
+          vk_find_struct_const(chain, PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES) ||
+          vk_find_struct_const(chain, PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES) ||
+          vk_find_struct_const(chain, PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES) ||
+          vk_find_struct_const(chain, PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES) ||
+          vk_find_struct_const(chain, PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES) ||
+          vk_find_struct_const(chain, PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES) ||
+          vk_find_struct_const(chain, PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES) ||
+          vk_find_struct_const(chain, PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES) ||
+          vk_find_struct_const(chain, PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES) ||
+          vk_find_struct_const(chain, PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES);
+}
+
+/*
+ * VK_EXT_shader_viewport_index_layer is emulated on top of the Vulkan 1.2
+ * features of the same name, and the driver only compiles the (translated)
+ * capabilities when those are enabled. Set them in the application's own
+ * Vulkan 1.2 struct if it has one, add a struct of ours if that can not clash.
+ */
+static void
+wrapper_force_viewport_layer_features(VkDeviceCreateInfo *ci,
+                                      VkPhysicalDeviceVulkan12Features *storage,
+                                      struct wrapper_feature_patch *patches, unsigned *n,
+                                      unsigned cap)
+{
+   VkPhysicalDeviceVulkan12Features *f = __vk_find_struct(
+      (void *)ci->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
+
+   if (f) {
+      wrapper_feature_patch(patches, n, cap, &f->shaderOutputViewportIndex, VK_TRUE);
+      wrapper_feature_patch(patches, n, cap, &f->shaderOutputLayer, VK_TRUE);
+      return;
+   }
+   if (wrapper_chain_has_split_v12_features(ci->pNext))
+      return;                     /* the driver takes the capabilities regardless */
+
+   storage->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+   storage->shaderOutputViewportIndex = VK_TRUE;
+   storage->shaderOutputLayer = VK_TRUE;
+   storage->pNext = (void *)ci->pNext;
+   ci->pNext = storage;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -827,10 +873,6 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
 
    list_inithead(&device->command_buffer_list);
    list_inithead(&device->device_memory_list);
-   list_inithead(&device->image_list);
-   list_inithead(&device->buffer_list);
-   device->image_table = _mesa_hash_table_u64_create(NULL);
-   device->buffer_table = _mesa_hash_table_u64_create(NULL);
    device->memory_table = _mesa_hash_table_u64_create(NULL);
 
    simple_mtx_init(&device->resource_mutex, mtx_plain);
@@ -848,8 +890,6 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
 
    if (result != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed to init Vulkan device, res %d", result);
-      _mesa_hash_table_u64_destroy(device->image_table);
-      _mesa_hash_table_u64_destroy(device->buffer_table);
       _mesa_hash_table_u64_destroy(device->memory_table);
       simple_mtx_destroy(&device->resource_mutex);
       vk_free2(&physical_device->instance->vk.alloc, pAllocator,
@@ -909,30 +949,51 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    wrapper_create_info.enabledExtensionCount = wrapper_enable_extension_count;
    wrapper_create_info.ppEnabledExtensionNames = wrapper_enable_extensions;
 
+   struct wrapper_feature_patch feature_patches[40];
+   unsigned n_feature_patches = 0;
+   const struct vk_features *base = &physical_device->base_supported_features;
+   const struct vk_features *app_enabled = &device->vk.enabled_features;
+
    pdf = (void *)pCreateInfo->pEnabledFeatures;
    pdf2 = __vk_find_struct((void *)pCreateInfo->pNext,
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
 
-#define DISABLE_FEATURE(f) \
-if (pdf && pdf->f) { \
-   pdf->f &= physical_device->base_supported_features.f; \
-} \
-\
-if (pdf2 && pdf2->features.f) { \
-   pdf2->features.f &= physical_device->base_supported_features.f; \
-}
+#define PATCH_FEATURE(f, v) do { \
+   if (pdf) \
+      wrapper_feature_patch(feature_patches, &n_feature_patches, ARRAY_SIZE(feature_patches), \
+                            &pdf->f, (v)); \
+   if (pdf2) \
+      wrapper_feature_patch(feature_patches, &n_feature_patches, ARRAY_SIZE(feature_patches), \
+                            &pdf2->features.f, (v)); \
+} while (0)
+#define STRIP_FEATURE(f) do { if (!base->f) PATCH_FEATURE(f, VK_FALSE); } while (0)
 
-   DISABLE_FEATURE(textureCompressionBC);
-   DISABLE_FEATURE(multiViewport);
-   DISABLE_FEATURE(depthClamp);
-   DISABLE_FEATURE(depthBiasClamp);
-   DISABLE_FEATURE(fillModeNonSolid);
-   DISABLE_FEATURE(shaderClipDistance);
-   DISABLE_FEATURE(shaderCullDistance);
-   DISABLE_FEATURE(dualSrcBlend);
-   DISABLE_FEATURE(multiDrawIndirect);
+   /* what the GPU lacks never reaches the driver (it refuses the device) */
+   STRIP_FEATURE(textureCompressionBC);
+   STRIP_FEATURE(multiViewport);
+   STRIP_FEATURE(depthClamp);
+   STRIP_FEATURE(depthBiasClamp);
+   STRIP_FEATURE(fillModeNonSolid);
+   STRIP_FEATURE(shaderClipDistance);
+   STRIP_FEATURE(shaderCullDistance);
+   STRIP_FEATURE(dualSrcBlend);
+   STRIP_FEATURE(multiDrawIndirect);
 
-#undef DISABLE_FEATURE
+   /* cull distance and wireframe are drawn by a geometry shader the wrapper
+    * builds: the driver needs the feature on, whether the application asked
+    * for it or not (only worth it when it asked for either of the two) */
+   device->emu_gs = (pdf || pdf2) && base->geometryShader &&
+      ((device->emu.fill_mode && app_enabled->fillModeNonSolid) ||
+       (device->emu.cull_distance && app_enabled->shaderCullDistance));
+   if (device->emu_gs) {
+      PATCH_FEATURE(geometryShader, VK_TRUE);
+      if (base->shaderTessellationAndGeometryPointSize)
+         PATCH_FEATURE(shaderTessellationAndGeometryPointSize, VK_TRUE);
+      device->emu_gs_point_size = base->shaderTessellationAndGeometryPointSize;
+   }
+
+#undef STRIP_FEATURE
+#undef PATCH_FEATURE
 
    process_pnext_chain((VkBaseInStructure *)&wrapper_create_info, device->physical);
 
@@ -955,6 +1016,14 @@ if (pdf2 && pdf2->features.f) { \
          &wrapper_dru_features, &wrapper_mv_features);
    }
 
+   VkPhysicalDeviceVulkan12Features wrapper_v12_features = {0};
+
+   if (device->emu.viewport_index_layer &&
+       device->vk.enabled_extensions.EXT_shader_viewport_index_layer)
+      wrapper_force_viewport_layer_features(&wrapper_create_info, &wrapper_v12_features,
+                                            feature_patches, &n_feature_patches,
+                                            ARRAY_SIZE(feature_patches));
+
    VkPhysicalDeviceDepthClipEnableFeaturesEXT wrapper_dce_features = {0};
 
    if (want_depth_clip) {
@@ -962,7 +1031,8 @@ if (pdf2 && pdf2->features.f) { \
          (void *)wrapper_create_info.pNext,
          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT);
       if (f) {
-         f->depthClipEnable = VK_TRUE;
+         wrapper_feature_patch(feature_patches, &n_feature_patches,
+                               ARRAY_SIZE(feature_patches), &f->depthClipEnable, VK_TRUE);
       } else {
          wrapper_dce_features.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT;
@@ -992,23 +1062,17 @@ if (pdf2 && pdf2->features.f) { \
    /* The chain with everything the wrapper spliced in: attempts 1..n_wsi */
    const void *full_chain = wrapper_create_info.pNext;
 
-   /* WSI extension tiers, heaviest first: [base+dmabuf+ahb] -> [base+dmabuf]
-    * -> [base]; only when the application presents (VK_KHR_swapchain). */
-   unsigned wsi_masks[3];
+   /* WSI extension tiers, heaviest first: [base+ahb] -> [base]; only when the
+    * application presents (VK_KHR_swapchain). */
+   unsigned wsi_masks[2];
    unsigned n_wsi = 0;
    {
       unsigned top = device->vk.enabled_extensions.KHR_swapchain ?
          (wrapper_wsi_wanted() & wrapper_wsi_available(physical_device)) : 0;
 
-      if (!top) {
-         wsi_masks[n_wsi++] = 0;
-      } else {
-         wsi_masks[n_wsi++] = top;
-         if (top & WRAPPER_WSI_AHB)
-            wsi_masks[n_wsi++] = top & ~WRAPPER_WSI_AHB;
-         if ((top & ~WRAPPER_WSI_BASE) && wsi_masks[n_wsi - 1] != (top & WRAPPER_WSI_BASE))
-            wsi_masks[n_wsi++] = top & WRAPPER_WSI_BASE;
-      }
+      wsi_masks[n_wsi++] = top;
+      if (top & WRAPPER_WSI_AHB)
+         wsi_masks[n_wsi++] = top & ~WRAPPER_WSI_AHB;
    }
 
    /* The application-only attempt only makes sense if the wrapper added anything. */
@@ -1017,6 +1081,7 @@ if (pdf2 && pdf2->features.f) { \
       full_chain != app_chain || wsi_masks[0] != 0;
    const unsigned total_attempts = n_wsi + (wrapper_added_something ? 1 : 0) + 1;
    unsigned attempt;
+   bool used_null_chain = false;
 
    /*
     * attempts 1..n_wsi   application list + wrapper additions + WSI tier i
@@ -1052,6 +1117,7 @@ if (pdf2 && pdf2->features.f) { \
          wrapper_create_info.enabledExtensionCount = app_extension_count;
          wrapper_create_info.ppEnabledExtensionNames = app_extensions;
          wrapper_create_info.pNext = NULL;
+         used_null_chain = true;
          WRAPPER_LOG(info, "createDevice attempt %u: NULL pNext chain", attempt + 1);
       }
 
@@ -1067,12 +1133,26 @@ if (pdf2 && pdf2->features.f) { \
    }
    create_stage = attempt + 1;
 
+   /* the driver call is over: the application's feature structs are what they
+    * were. A device made without the feature chain has no geometry shader. */
+   wrapper_feature_restore(feature_patches, n_feature_patches);
+   if (used_null_chain && !pdf)
+      device->emu_gs = false;
+   if (!device->emu_gs)
+      device->emu_gs_point_size = false;
+
    if (result != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed driver createDevice, res %d", result);
       wrapper_emit_diag(physical_device, pCreateInfo, result);
       wrapper_DestroyDevice(wrapper_device_to_handle(device),
                             &device->vk.alloc);
       return vk_error(physical_device, result);
+   }
+
+   /* swapchain images are AHardwareBuffers when the driver device got the extension */
+   for (uint32_t i = 0; i < wrapper_create_info.enabledExtensionCount; i++) {
+      if (strcmp(wrapper_create_info.ppEnabledExtensionNames[i], WRAPPER_WSI_AHB_NAME) == 0)
+         device->wsi_ahb = true;
    }
 
    if (create_stage > 1)
@@ -1113,196 +1193,6 @@ if (pdf2 && pdf2->features.f) { \
    *pDevice = wrapper_device_to_handle(device);
 
    return VK_SUCCESS;
-}
-
-static void 
-wrapper_buffer_destroy(struct wrapper_device *device,
-					   struct wrapper_buffer *wb,
-					   const VkAllocationCallbacks *pAllocator)
-{
-   if (wb == NULL)
-      return;
-
-   simple_mtx_lock(&device->resource_mutex);
-      
-   device->dispatch_table.DestroyBuffer(device->dispatch_handle,
-      wb->dispatch_handle, pAllocator);
-
-   _mesa_hash_table_u64_remove(device->buffer_table, (uint64_t)wb->dispatch_handle);
-   list_del(&wb->link);
-
-   simple_mtx_unlock(&device->resource_mutex);
-   
-   vk_object_free(&device->vk, &device->vk.alloc, wb);
-}
-
-VKAPI_ATTR VkResult VKAPI_CALL
-wrapper_CreateBuffer(VkDevice _device,
-					 const VkBufferCreateInfo *pCreateInfo,
-					 const VkAllocationCallbacks *pAllocator,
-					 VkBuffer *pBuffer)
-{
-   VK_FROM_HANDLE(wrapper_device, device, _device);
-   VkResult res;
-   VkExternalMemoryHandleTypeFlags handle_types = 0;
-
-   const VkExternalMemoryBufferCreateInfo *ext_info =
-      vk_find_struct_const(pCreateInfo->pNext, EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
-   if (ext_info) {
-      handle_types = ext_info->handleTypes;
-   }
-
-   res = device->dispatch_table.CreateBuffer(device->dispatch_handle,
-      pCreateInfo, pAllocator, pBuffer);
-
-   if (res != VK_SUCCESS) {
-      WRAPPER_LOG(error, "Failed to create buffer, res %d", res);
-      return res;
-   }
-
-   simple_mtx_lock(&device->resource_mutex);
-
-   struct wrapper_buffer *wb = vk_object_zalloc(&device->vk, 
-      &device->vk.alloc, sizeof(struct wrapper_buffer), VK_OBJECT_TYPE_BUFFER);
-
-   if (!wb) {
-      WRAPPER_LOG(error, "Failed to allocate wrapper_buffer");
-      simple_mtx_unlock(&device->resource_mutex);
-      device->dispatch_table.DestroyBuffer(device->dispatch_handle, *pBuffer, pAllocator);
-      *pBuffer = VK_NULL_HANDLE;
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-   }
-      
-   wb->device = device;
-   wb->size = pCreateInfo->size;
-   wb->dispatch_handle = *pBuffer;
-   wb->handle_types = handle_types;
-
-   list_add(&wb->link, &device->buffer_list);
-   _mesa_hash_table_u64_insert(device->buffer_table, (uint64_t)wb->dispatch_handle, wb);
-
-   simple_mtx_unlock(&device->resource_mutex);
-   
-   return VK_SUCCESS;
-}
-
-VKAPI_ATTR void VKAPI_CALL
-wrapper_DestroyBuffer(VkDevice _device,
-					  VkBuffer buffer,
-					  const VkAllocationCallbacks *pAllocator)
-{
-   VK_FROM_HANDLE(wrapper_device, device, _device);
-
-   struct wrapper_buffer *wb = get_wrapper_buffer_from_handle(device, buffer);
-   wrapper_buffer_destroy(device, wb, pAllocator);
-}
-
-static void 
-wrapper_image_destroy(struct wrapper_device *device,
-					  struct wrapper_image *wi,
-					  const VkAllocationCallbacks *pAllocator)
-{
-   if (wi == NULL)
-      return;
-
-   simple_mtx_lock(&device->resource_mutex);
-      
-   device->dispatch_table.DestroyImage(device->dispatch_handle,
-      wi->dispatch_handle, pAllocator);
-
-   _mesa_hash_table_u64_remove(device->image_table, (uint64_t)wi->dispatch_handle);
-   list_del(&wi->link);
-
-   simple_mtx_unlock(&device->resource_mutex);
-   
-   vk_object_free(&device->vk, &device->vk.alloc, wi);
-}
-
-VKAPI_ATTR VkResult VKAPI_CALL
-wrapper_CreateImage(VkDevice _device,
-					const VkImageCreateInfo *pCreateInfo,
-					const VkAllocationCallbacks *pAllocator,
-					VkImage *pImage)
-{
-   VK_FROM_HANDLE(wrapper_device, device, _device);
-   VkResult res;
-   VkImageCreateInfo create_info;
-   bool is_wsi_image = false;
-   VkExternalMemoryHandleTypeFlags handle_types = 0;
-
-   /* No B8G8R8A8 emulation lives in the wrapper any more. If the WSI layer still
-    * tags an image with its private marker struct, just drop the marker so the
-    * driver never sees an unknown struct. */
-   VkBaseInStructure *prev = (VkBaseInStructure *) pCreateInfo;
-   for (const VkBaseInStructure *s = pCreateInfo->pNext; s; s = s->pNext) {
-      if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EMULATED_B8G8R8A8_CREATE_INFO_EXT) {
-         prev->pNext = s->pNext; // unlink
-         break;
-      }
-      prev = (VkBaseInStructure *) s;
-   }
-
-   // Tag swapchain images using VK_STRUCTURE_TYPE_WSI_IMAGE_CREATE_INFO_MESA
-   const struct wsi_image_create_info *wsi_info =
-      vk_find_struct_const(pCreateInfo->pNext, WSI_IMAGE_CREATE_INFO_MESA);
-   if (wsi_info) {
-      is_wsi_image = true;
-   }
-
-   const VkExternalMemoryImageCreateInfo *ext_info =
-      vk_find_struct_const(pCreateInfo->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
-   if (ext_info) {
-      handle_types = ext_info->handleTypes;
-   }
-
-   /* Copy after the unlink above: when the marker struct is the head of the
-    * pNext chain, the unlink only updates pCreateInfo->pNext, so a copy taken
-    * earlier would still pass the unknown struct to the driver. */
-   create_info = *pCreateInfo;
-
-   res = device->dispatch_table.CreateImage(device->dispatch_handle,
-      &create_info, pAllocator, pImage);
-
-   if (res != VK_SUCCESS) {
-      WRAPPER_LOG(error, "Failed to create image, res %d", res);
-      return res;
-   }
-
-   simple_mtx_lock(&device->resource_mutex);
-
-   struct wrapper_image *wi = vk_object_zalloc(&device->vk,
-      &device->vk.alloc, sizeof(struct wrapper_image), VK_OBJECT_TYPE_IMAGE);
-
-   if (!wi) {
-      WRAPPER_LOG(error, "Failed to allocate wrapper_image");
-      simple_mtx_unlock(&device->resource_mutex);
-      device->dispatch_table.DestroyImage(device->dispatch_handle, *pImage, pAllocator);
-      *pImage = VK_NULL_HANDLE;
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-   }
-
-   wi->device = device;
-   wi->dispatch_handle = *pImage;
-   wi->is_wsi_image = is_wsi_image;
-   wi->handle_types = handle_types;
-
-   list_add(&wi->link, &device->image_list);
-   _mesa_hash_table_u64_insert(device->image_table, (uint64_t)wi->dispatch_handle, wi);
-
-   simple_mtx_unlock(&device->resource_mutex);
-
-   return VK_SUCCESS;
-}
-
-VKAPI_ATTR void VKAPI_CALL
-wrapper_DestroyImage(VkDevice _device,
-					 VkImage image,
-					 const VkAllocationCallbacks *pAllocator)
-{
-   VK_FROM_HANDLE(wrapper_device, device, _device);
-
-   struct wrapper_image *wi = get_wrapper_image_from_handle(device, image);
-   wrapper_image_destroy(device, wi, pAllocator);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1522,14 +1412,23 @@ wrapper_CmdExecuteCommands(VkCommandBuffer commandBuffer,
                            const VkCommandBuffer* pCommandBuffers)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
-   VkCommandBuffer command_buffers[commandBufferCount];
+   VkCommandBuffer stack[32];
+   VkCommandBuffer *command_buffers = stack;
 
-   for (int i = 0; i < commandBufferCount; i++) {
+   /* the usual count fits the stack; a large one must not blow it */
+   if (commandBufferCount > ARRAY_SIZE(stack)) {
+      command_buffers = malloc(commandBufferCount * sizeof(*command_buffers));
+      if (!command_buffers)
+         return;
+   }
+   for (uint32_t i = 0; i < commandBufferCount; i++) {
       command_buffers[i] =
          wrapper_command_buffer_from_handle(pCommandBuffers[i])->dispatch_handle;
    }
    wcb->device->dispatch_table.CmdExecuteCommands(
       wcb->dispatch_handle, commandBufferCount, command_buffers);
+   if (command_buffers != stack)
+      free(command_buffers);
 }
 
 /* Driver-specific SPIR-V workarounds. Shared by wrapper_CreateShaderModule()
@@ -1558,46 +1457,32 @@ wrapper_CreateShaderModule(VkDevice _device,
 						   VkShaderModule *pShaderModule)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
-   static int wrapper_remove_clip_distance = -2;   /* -2 unset, -1 auto, 0 off, 1 on */
    VkShaderModuleCreateInfo create_info = *pCreateInfo;
-   uint32_t *patched = NULL;
+   uint32_t *words = NULL;
    VkResult result;
 
    /*
-    * ClipDistance is only stripped when the driver itself reports no
-    * shaderClipDistance: a shader that still declares it would not compile
-    * then. (When the wrapper emulates the feature the pipeline gets a lowered
-    * copy of the shader instead, see wrapper_emu.c; this stripped module is
-    * only what the driver is given for a pipeline that can't be lowered.)
-    * When the driver supports it the shader is passed through untouched.
-    * WRAPPER_REMOVE_CLIP_DISTANCE=1 forces the strip (old behavior), =0 never
-    * strips; WRAPPER_NO_REMOVE_CLIP_DISTANCE=1 is the old spelling of =0.
+    * SPIR-V that needs a change gets a private copy; everything else goes to
+    * the driver as the application wrote it. A change is the Arm workaround
+    * patch, or something the GPU would refuse (ClipDistance / CullDistance it
+    * lacks -- pipelines the emulation can lower get modules of their own, see
+    * wrapper_emu.c --, SPV_EXT_shader_viewport_index_layer, a geometry shader
+    * writing gl_ViewportIndex): wrapper_emu_fixup_module(). It is a pure
+    * function of the SPIR-V, so no lock: the shader compile threads run in
+    * parallel.
     */
-   if (wrapper_remove_clip_distance == -2) {
-      const char *rcd = getenv("WRAPPER_REMOVE_CLIP_DISTANCE");
-      const char *nrcd = getenv("WRAPPER_NO_REMOVE_CLIP_DISTANCE");
-      if (rcd)
-         wrapper_remove_clip_distance = atoi(rcd) ? 1 : 0;
-      else if (nrcd && atoi(nrcd))
-         wrapper_remove_clip_distance = 0;
-      else
-         wrapper_remove_clip_distance = -1;
-   }
+   if (create_info.codeSize >= 5 * sizeof(uint32_t) &&
+       (device->physical->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY ||
+        wrapper_spv_scan(create_info.pCode, create_info.codeSize))) {
+      words = malloc(create_info.codeSize);
+      if (words) {
+         size_t size = create_info.codeSize;
 
-   /* Pure function of the SPIR-V: no lock needed (it only serialized the
-    * parallel shader compilation threads), and the patched copy is released
-    * right after the driver call instead of leaking one module per shader. */
-   if (device->physical->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY &&
-       create_info.codeSize >= 5 * sizeof(uint32_t)) {
-      patched = malloc(create_info.codeSize);
-      if (patched) {
-         memcpy(patched, create_info.pCode, create_info.codeSize);
-         wrapper_shader_driver_patch(device, patched, create_info.codeSize);
-         if (wrapper_remove_clip_distance == 1 ||
-             (wrapper_remove_clip_distance == -1 &&
-              !device->physical->base_supported_features.shaderClipDistance))
-            remove_ClipDistance(patched, &create_info.codeSize);
-         create_info.pCode = patched;
+         memcpy(words, create_info.pCode, size);
+         wrapper_shader_driver_patch(device, words, size);
+         wrapper_emu_fixup_module(device, &words, &size);
+         create_info.pCode = words;
+         create_info.codeSize = size;
       }
    }
 
@@ -1613,7 +1498,7 @@ wrapper_CreateShaderModule(VkDevice _device,
       wrapper_emu_add_shader(device, *pShaderModule, pCreateInfo->pCode,
                              pCreateInfo->codeSize);
 
-   free(patched);
+   free(words);
    return result;
 }
 
@@ -1761,15 +1646,6 @@ wrapper_DestroyDevice(VkDevice _device, const VkAllocationCallbacks* pAllocator)
    simple_mtx_unlock(&device->resource_mutex);
 
    wrapper_device_memory_destroy_all(device);
-   
-   list_for_each_entry_safe(struct wrapper_buffer, wb,
-                            &device->buffer_list, link) {
-      wrapper_buffer_destroy(device, wb, pAllocator);
-   }
-   list_for_each_entry_safe(struct wrapper_image, wi,
-                            &device->image_list, link) {
-      wrapper_image_destroy(device, wi, pAllocator);
-   }
 
    list_for_each_entry_safe(struct vk_queue, queue, &device->vk.queues, link) {
       vk_queue_finish(queue);
@@ -1781,8 +1657,6 @@ wrapper_DestroyDevice(VkDevice _device, const VkAllocationCallbacks* pAllocator)
       device->dispatch_table.DestroyDevice(device->
          dispatch_handle, pAllocator);
    }
-   _mesa_hash_table_u64_destroy(device->image_table);
-   _mesa_hash_table_u64_destroy(device->buffer_table);
    _mesa_hash_table_u64_destroy(device->memory_table);
    simple_mtx_destroy(&device->resource_mutex);
    vk_device_finish(&device->vk);

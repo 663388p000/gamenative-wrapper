@@ -15,10 +15,10 @@ wsi_get_ahardware_buffer_blit_type(const struct wsi_device *wsi,
 {
    AHardwareBuffer *ahardware_buffer;
    VkResult result;
-   uint32_t probe_format = wsi->emulate_bgra8
-         ? AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
-         : AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM;
-   
+   /* the swapchain format is what the application asked for: B8G8R8A8 is
+    * probed as it is, nothing is swapped for R8G8B8A8 behind its back */
+   const uint32_t probe_format = AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM;
+
    if (AHardwareBuffer_allocate(&(AHardwareBuffer_Desc){
       .width = 500,
       .height = 500,
@@ -135,18 +135,10 @@ wsi_create_ahardware_buffer_image_mem(const struct wsi_swapchain *chain,
    }
 
    VkImageCreateInfo new_image_create_info = info->create;
-   if (ahardware_buffer_format_props.externalFormat && !wsi->emulate_bgra8)
+   if (ahardware_buffer_format_props.externalFormat)
       new_image_create_info.flags &=
          ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
    new_image_create_info.format = ahardware_buffer_format_props.format;
-
-   VkEmulatedB8G8R8A8CreateInfoExt emulated_bgra8_ext = {
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EMULATED_B8G8R8A8_CREATE_INFO_EXT,
-      .pNext = new_image_create_info.pNext,
-   };
-   if (wsi->emulate_bgra8) {
-      new_image_create_info.pNext = &emulated_bgra8_ext;
-   }
 
    result = wsi->CreateImage(chain->device,
                              &new_image_create_info,

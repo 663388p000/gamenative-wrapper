@@ -183,6 +183,7 @@ struct wsi_device {
    bool forcesync;
 
    bool needs_blit;
+   bool emulate_bgra8;
    bool enable_ahb_ownership_release;
 
    /* Set to true if the implementation is ok with linear WSI images. */

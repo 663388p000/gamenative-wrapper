@@ -941,6 +941,10 @@ lower_builtin_vs(Module &m, const char *name, uint32_t builtin, uint32_t cap, ui
     */
    m.index();
 
+   VarInfo vi;
+   if (!m.var_info(V, vi) || vi.pointee != S)
+      return false;
+
    const Inst *orig_struct = m.def(S);
    if (!orig_struct || orig_struct->op != OpTypeStruct_ ||
        orig_struct->w.size() < (size_t)k + 2)

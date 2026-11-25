@@ -2,11 +2,9 @@
 #include "wsi_common_private.h"
 #include "vk_log.h"
 #include "../wrapper/wrapper_log.h"
-#include "../wrapper/wrapper_private.h"
 
 #include <android/hardware_buffer.h>
 
-#define AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM 1
 #define AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM 5
 
 static enum wsi_swapchain_blit_type
@@ -15,15 +13,12 @@ wsi_get_ahardware_buffer_blit_type(const struct wsi_device *wsi,
 {
    AHardwareBuffer *ahardware_buffer;
    VkResult result;
-   uint32_t probe_format = wsi->emulate_bgra8
-         ? AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
-         : AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM;
    
    if (AHardwareBuffer_allocate(&(AHardwareBuffer_Desc){
       .width = 500,
       .height = 500,
       .layers = 1,
-      .format = probe_format,
+      .format = AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM,
       .usage = AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
                AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
                AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
@@ -88,7 +83,6 @@ wsi_get_ahardware_buffer_blit_type(const struct wsi_device *wsi,
       return WSI_SWAPCHAIN_IMAGE_BLIT;
    }
 
-   WRAPPER_LOG(info, "wsi_get_ahardware_buffer_blit_type: WSI_SWAPCHAIN_NO_BLIT");
    return WSI_SWAPCHAIN_NO_BLIT;
 }
 
@@ -135,18 +129,10 @@ wsi_create_ahardware_buffer_image_mem(const struct wsi_swapchain *chain,
    }
 
    VkImageCreateInfo new_image_create_info = info->create;
-   if (ahardware_buffer_format_props.externalFormat && !wsi->emulate_bgra8)
+   if (ahardware_buffer_format_props.externalFormat)
       new_image_create_info.flags &=
          ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
    new_image_create_info.format = ahardware_buffer_format_props.format;
-
-   VkEmulatedB8G8R8A8CreateInfoExt emulated_bgra8_ext = {
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EMULATED_B8G8R8A8_CREATE_INFO_EXT,
-      .pNext = new_image_create_info.pNext,
-   };
-   if (wsi->emulate_bgra8) {
-      new_image_create_info.pNext = &emulated_bgra8_ext;
-   }
 
    result = wsi->CreateImage(chain->device,
                              &new_image_create_info,
@@ -187,107 +173,6 @@ wsi_create_ahardware_buffer_image_mem(const struct wsi_swapchain *chain,
    image->drm_modifier = 1255;
 
    return VK_SUCCESS;
-}
-
-/* Release the image to an external consumer.
- *
- * The direct AHardwareBuffer path exports an image that another Vulkan device
- * may read. Vulkan models that handoff as a queue-family ownership transfer.
- * The producing device must perform the release so driver-private image state
- * is made available to the importer.
- */
-static VkResult
-wsi_create_ahb_release_cmd_buffers(const struct wsi_swapchain *chain,
-                                   struct wsi_image *image)
-{
-   const struct wsi_device *wsi = chain->wsi;
-   VkResult result;
-
-   const uint32_t count = wsi->queue_family_count;
-   image->ahb_release_cmd_buffers =
-      vk_zalloc(&chain->alloc, sizeof(VkCommandBuffer) * count, 8,
-                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-   if (!image->ahb_release_cmd_buffers)
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-
-   for (uint32_t i = 0; i < count; i++) {
-      if (!chain->cmd_pools[i])
-         continue;
-
-      const VkCommandBufferAllocateInfo cmd_buffer_info = {
-         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-         .commandPool = chain->cmd_pools[i],
-         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-         .commandBufferCount = 1,
-      };
-      result = wsi->AllocateCommandBuffers(chain->device, &cmd_buffer_info,
-                                           &image->ahb_release_cmd_buffers[i]);
-      if (result != VK_SUCCESS) {
-         WRAPPER_LOG(error, "Failed to allocate ahb release cmd buffer, res %d",
-                     result);
-         return result;
-      }
-
-      const VkCommandBufferBeginInfo begin_info = {
-         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-      };
-      result = wsi->BeginCommandBuffer(image->ahb_release_cmd_buffers[i],
-                                       &begin_info);
-      if (result != VK_SUCCESS) {
-         WRAPPER_LOG(error, "Failed to begin ahb release cmd buffer, res %d",
-                     result);
-         return result;
-      }
-
-      const VkImageMemoryBarrier release = {
-         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-         /* The WSI does not know how the application produced the image.
-          * Cover every write rather than assuming color-attachment or blit
-          * presentation. */
-         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-         /* Ignored for a release operation. */
-         .dstAccessMask = 0,
-         .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-         /* The importer has to begin its acquire from the layout this release
-          * ends in, and it cannot name PRESENT_SRC_KHR for an image that does
-          * not belong to its own swapchain. GENERAL is valid on both sides and,
-          * unlike UNDEFINED, keeps the contents -- which is the whole point of
-          * handing the image over. */
-         .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-         .srcQueueFamilyIndex = i,
-         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
-         .image = image->image,
-         .subresourceRange = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel = 0,
-            .levelCount = 1,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
-         },
-      };
-      wsi->CmdPipelineBarrier(image->ahb_release_cmd_buffers[i],
-                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                              VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                              0, 0, NULL, 0, NULL, 1, &release);
-
-      result = wsi->EndCommandBuffer(image->ahb_release_cmd_buffers[i]);
-      if (result != VK_SUCCESS) {
-         WRAPPER_LOG(error, "Failed to record ahb release barrier, res %d",
-                     result);
-         return result;
-      }
-   }
-
-   mesa_logd("Recorded AHB ownership release barriers");
-   return VK_SUCCESS;
-}
-
-static VkResult
-wsi_finish_create_ahardware_buffer_image(const struct wsi_swapchain *chain,
-                                         const struct wsi_image_info *info,
-                                         struct wsi_image *image)
-{
-   return wsi_create_ahb_release_cmd_buffers(chain, image);
 }
 
 static VkResult
@@ -417,9 +302,6 @@ wsi_create_ahardware_buffer_blit_context(const struct wsi_swapchain *chain,
 inline static uint32_t
 to_ahardware_buffer_format(VkFormat format) {
    switch (format) {
-   case VK_FORMAT_R8G8B8A8_SRGB:
-   case VK_FORMAT_R8G8B8A8_UNORM:
-      return AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
    case VK_FORMAT_B8G8R8A8_SRGB:
    case VK_FORMAT_B8G8R8A8_UNORM:
       return AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM;
@@ -454,20 +336,7 @@ wsi_configure_ahardware_buffer_image(const struct wsi_swapchain *chain,
       wsi_destroy_image_info(chain, info);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
-
-   // WARNING: The secondary AHB MUST be declared as AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
-   // to allow certain mobile drivers to import it, but X11 treats its memory backing 
-   // as physical [B, G, R, A] (in reverse order).
-   //
-   // We CANNOT use vkCmdBlitImage: Vulkan will detect the format mismatch between 
-   // B8G8R8A8 (primary) and R8G8B8A8 (secondary) and perform an automatic channel swizzle 
-   // [B,G,R,A] -> [R,G,B,A], which breaks X11's expected layout.
-   //
-   // We MUST use vkCmdCopyImage for a pure bitwise copy, and force the primary image 
-   // to B8G8R8A8 upfront so the rendered memory is already in [B, G, R, A] order.
-   // 
-   // Similarly, we CANNOT advertise an [R,G,B,A] format for the primary image without
-   // a design to copy+swizzle the blit from the primary to the secondary.
+   
    *info->ahardware_buffer_desc = (AHardwareBuffer_Desc) {
       .width = pCreateInfo->imageExtent.width,
       .height = pCreateInfo->imageExtent.height,
@@ -509,16 +378,8 @@ wsi_configure_android_image(
       info->create_mem = wsi_create_ahardware_buffer_blit_context;
    } else {
       info->create_mem = wsi_create_ahardware_buffer_image_mem;
-      /* Legacy VkImageMemoryBarrier only permits FOREIGN_EXT ownership
-       * transfers for exclusive images. Preserve the existing concurrent
-       * path instead of recording an invalid barrier for it. */
-      if (info->create.sharingMode == VK_SHARING_MODE_EXCLUSIVE &&
-          chain->wsi->enable_ahb_ownership_release) {
-         WRAPPER_LOG(info,
-                     "Enabling AHB ownership release for direct exclusive swapchain");
-         info->finish_create = wsi_finish_create_ahardware_buffer_image;
-      }
    }
 
    return VK_SUCCESS;
 }
+

@@ -930,7 +930,8 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    VkPhysicalDeviceFeatures *pdf;
    VkResult result;
    void *app_chain = NULL;
-   const void *full_chain = NULL;
+   void *full_chain = NULL;
+   const void *full_chain_current = NULL;
    void *full_chain_allocated = NULL;
    VkPhysicalDeviceFeatures *private_enabled_features = NULL;
    static int wrapper_safe_create_device = -1;
@@ -1194,7 +1195,7 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
       wrapper_safe_create_device = getenv("WRAPPER_SAFE_CREATE_DEVICE") ? atoi(getenv("WRAPPER_SAFE_CREATE_DEVICE")) : 1;
    }
 
-   full_chain = wrapper_create_info.pNext;
+   full_chain_current = wrapper_create_info.pNext;
 
    /* full_chain contains all wrapper additions. */
 
@@ -1214,7 +1215,7 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    /* The application-only attempt only makes sense if the wrapper added anything. */
    const bool wrapper_added_something =
       wrapper_enable_extension_count != app_extension_count ||
-      full_chain != app_chain || wsi_masks[0] != 0;
+      full_chain_current != app_chain || wsi_masks[0] != 0;
    const unsigned total_attempts = n_wsi + (wrapper_added_something ? 1 : 0) + 1;
    unsigned attempt;
    bool used_null_chain = false;
@@ -1235,7 +1236,7 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
          wrapper_add_wsi_extensions(physical_device, wsi_masks[attempt], &n, attempt_extensions);
          wrapper_create_info.enabledExtensionCount = n;
          wrapper_create_info.ppEnabledExtensionNames = attempt_extensions;
-         wrapper_create_info.pNext = full_chain;
+         wrapper_create_info.pNext = full_chain_current;
          if (attempt == 0 && WRAPPER_LOG_LEVEL(info)) {
             for (uint32_t i = 0; i < n; i++)
                WRAPPER_LOG(info, "Enabling device extension %s", attempt_extensions[i]);

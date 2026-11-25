@@ -930,7 +930,7 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    VkPhysicalDeviceFeatures *pdf;
    VkResult result;
    void *app_chain = NULL;
-   void *full_chain = NULL;
+   const void *full_chain = NULL;
    void *full_chain_allocated = NULL;
    VkPhysicalDeviceFeatures *private_enabled_features = NULL;
    static int wrapper_safe_create_device = -1;

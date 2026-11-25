@@ -1,91 +1,91 @@
-import xml.etree.ElementTree as ET
-from pathlib import Path
 import re
 import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
 
-xml_path = Path.home() / "storage/downloads/vk.xml"
-out_path = Path("wrapper_pnext_sizes.inc")
+if len(sys.argv) != 3:
+    raise SystemExit(
+        "Usage: generate_pnext_sizes.py vk.xml output.inc"
+    )
 
-if not xml_path.is_file():
-    print("ERROR: vk.xml not found:", xml_path)
-else:
-    root = ET.parse(xml_path).getroot()
-    entries = {}
-    conflicts = []
-    skipped = 0
+xml_path = Path(sys.argv[1])
+out_path = Path(sys.argv[2])
 
-    for struct in root.findall("./types/type[@category='struct']"):
-        name = struct.get("name")
+header_dir = Path("include/vulkan")
+if not xml_path.is_file() or not header_dir.is_dir():
+    raise RuntimeError("Registry or Vulkan headers not found")
 
-        if not name:
-            name = struct.findtext("name")
+headers = "\n".join(
+    p.read_text(errors="ignore")
+    for p in header_dir.glob("*.h")
+)
 
-        if not name or not name.startswith("Vk"):
-            skipped += 1
-            continue
+root = ET.parse(xml_path).getroot()
+entries = {}
+conflicts = []
 
-        if struct.get("alias"):
-            skipped += 1
-            continue
+for struct in root.findall("./types/type[@category='struct']"):
+    name = struct.get("name") or struct.findtext("name")
 
-        extends = struct.get("structextends", "").split(",")
-        if "VkDeviceCreateInfo" not in extends:
-            skipped += 1
-            continue
+    if not name or struct.get("alias"):
+        continue
 
-        members = {
-            member.findtext("name"): member
-            for member in struct.findall("member")
-        }
+    extends = struct.get("structextends", "").split(",")
+    if "VkDeviceCreateInfo" not in extends:
+        continue
 
-        if "sType" not in members or "pNext" not in members:
-            skipped += 1
-            continue
+    members = {
+        m.findtext("name"): m
+        for m in struct.findall("member")
+    }
 
-        stype = members["sType"].get("values", "").strip()
+    if "sType" not in members or "pNext" not in members:
+        continue
 
-        if not re.fullmatch(r"VK_STRUCTURE_TYPE_[A-Z0-9_]+", stype):
-            skipped += 1
-            continue
+    stype = members["sType"].get("values", "").strip()
 
-        entry = (name, struct.get("protect"))
+    if not re.fullmatch(r"VK_STRUCTURE_TYPE_[A-Z0-9_]+", stype):
+        continue
 
-        if stype in entries and entries[stype] != entry:
-            conflicts.append((stype, entries[stype], entry))
-        else:
-            entries[stype] = entry
+    # Do not generate references absent from this checkout's headers.
+    if not re.search(r"\b" + re.escape(name) + r"\b", headers):
+        continue
 
-    if conflicts:
-        print("ERROR: sType conflicts:")
-        for item in conflicts:
-            print(item)
+    if not re.search(r"\b" + re.escape(stype) + r"\b", headers):
+        continue
 
-    elif not entries:
-        print("ERROR: No VkDeviceCreateInfo extensions found.")
+    entry = (name, struct.get("protect"))
 
+    if stype in entries and entries[stype] != entry:
+        conflicts.append((stype, entries[stype], entry))
     else:
-        lines = [
-            "/* Generated from vk.xml. */",
-            "/* Only VkDeviceCreateInfo.pNext structures. */",
-            ""
-        ]
+        entries[stype] = entry
 
-        for stype, (name, protect) in sorted(entries.items()):
-            if protect:
-                lines.append(f"#ifdef {protect}")
+if conflicts:
+    raise RuntimeError(f"Conflicting sTypes: {conflicts}")
 
-            lines.append(f"   case {stype}: return sizeof({name});")
+if not entries:
+    raise RuntimeError("No compatible VkDeviceCreateInfo structures found")
 
-            if protect:
-                lines.append("#endif")
+lines = [
+    "/* Generated from this checkout's Vulkan registry. */",
+    "/* Do not edit manually. */",
+    ""
+]
 
-            lines.append("")
+for stype, (name, protect) in sorted(entries.items()):
+    if protect:
+        lines.append(f"#ifdef {protect}")
 
-        out_path.write_text("\n".join(lines))
+    lines.append(f"   case {stype}: return sizeof({name});")
 
-        print("GENERATION SUCCESS")
-        print("Structures:", len(entries))
-        print("Skipped:", skipped)
-        print("Protected:", sum(bool(p) for _, p in entries.values()))
-        print("Output:", out_path.resolve())
-        print("Size:", out_path.stat().st_size)
+    if protect:
+        lines.append("#endif")
+
+    lines.append("")
+
+out_path.parent.mkdir(parents=True, exist_ok=True)
+out_path.write_text("\n".join(lines))
+
+print("Generated:", out_path)
+print("Structures:", len(entries))

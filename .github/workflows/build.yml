@@ -30,25 +30,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install mako PyYAML meson ninja packaging
-
-          
+              
       - name: Generate pNext structure sizes
         run: |
-          REGISTRY="$(find . -type f -path '*/registry/vk.xml' -print -quit)"
+          REGISTRY="src/vulkan/registry/vk.xml"
 
-          if [ -z "$REGISTRY" ]; then
-            echo "ERROR: Vulkan registry not found"
-            exit 1
-          fi
-
-          echo "Using registry: $REGISTRY"
-
-          python3 src/vulkan/wrapper/generate_pnext_sizes.py \ \
+          python3 src/vulkan/wrapper/generate_pnext_sizes.py \
             "$REGISTRY" \
             src/vulkan/wrapper/wrapper_pnext_sizes.inc
-
-          test -s src/vulkan/wrapper/wrapper_pnext_sizes.inc
-
 
       - name: Generate Meson Cross File for NDK
         run: |

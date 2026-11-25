@@ -276,9 +276,9 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
        */
       supported_features->presentId = true;
       /* VK_EXT_map_memory_placed is not implemented by the wrapper any more */
-      supported_features->memoryMapPlaced = false;
-      supported_features->memoryMapRangePlaced = false;
-      supported_features->memoryUnmapReserve = false;
+      supported_features->memoryMapPlaced = true;
+      supported_features->memoryMapRangePlaced = true;
+      supported_features->memoryUnmapReserve = true;
 
       /* the driver is asked first (base_supported_features above); what it
        * lacks and the wrapper can build is built and reported (wrapper_emu.c) */
@@ -291,7 +291,7 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          supported_features->presentWait = supported_features->timelineSemaphore;
       }
       supported_features->swapchainMaintenance1 = true;
-      supported_features->imageCompressionControlSwapchain = false;
+      supported_features->imageCompressionControlSwapchain = true;
       
       /* WRAPPER_WSI_SW=1: present through shared memory / put-image instead of
        * AHardwareBuffer-backed images (slower, but needs nothing from the
@@ -336,15 +336,6 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          bool is_vkd3d = strstr(engine_name, "vkd3d");
          bool is_d3d = strstr(engine_name, "DXVK") || is_vkd3d;
          pdevice->is_vkd3d = is_vkd3d;
-
-
-         if (!is_d3d) {
-            WRAPPER_LOG(info, "Disabling VK_EXT_extended_dynamic_state and VK_EXT_extended_dynamic_state2");
-            pdevice->vk.supported_extensions.EXT_extended_dynamic_state = false;
-            pdevice->vk.supported_extensions.EXT_extended_dynamic_state2 = false;
-         }
-      }
-
       list_addtail(&pdevice->vk.link, &_instance->physical_devices.list);
    }
 

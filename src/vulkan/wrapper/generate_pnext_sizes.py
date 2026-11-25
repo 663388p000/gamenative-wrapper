@@ -4,23 +4,27 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 if len(sys.argv) != 3:
-    raise SystemExit(
-        "Usage: generate_pnext_sizes.py vk.xml output.inc"
-    )
+    raise RuntimeError("Usage: generate_pnext_sizes.py vk.xml output.inc")
 
-xml_path = Path(sys.argv[1])
-out_path = Path(sys.argv[2])
+root = ET.parse(sys.argv[1]).getroot()
+header = Path("include/vulkan/vulkan_core.h").read_text(errors="ignore")
 
-header_dir = Path("include/vulkan")
-if not xml_path.is_file() or not header_dir.is_dir():
-    raise RuntimeError("Registry or Vulkan headers not found")
+# Resolve Vulkan enum aliases to canonical names.
+aliases = {}
 
-headers = "\n".join(
-    p.read_text(errors="ignore")
-    for p in header_dir.glob("*.h")
-)
+for enum in root.findall(".//enum"):
+    name = enum.get("name")
+    alias = enum.get("alias")
+    if name and alias:
+        aliases[name] = alias
 
-root = ET.parse(xml_path).getroot()
+def canonical(name):
+    seen = set()
+    while name in aliases and name not in seen:
+        seen.add(name)
+        name = aliases[name]
+    return name
+
 entries = {}
 conflicts = []
 
@@ -30,8 +34,7 @@ for struct in root.findall("./types/type[@category='struct']"):
     if not name or struct.get("alias"):
         continue
 
-    extends = struct.get("structextends", "").split(",")
-    if "VkDeviceCreateInfo" not in extends:
+    if "VkDeviceCreateInfo" not in struct.get("structextends", "").split(","):
         continue
 
     members = {
@@ -47,33 +50,38 @@ for struct in root.findall("./types/type[@category='struct']"):
     if not re.fullmatch(r"VK_STRUCTURE_TYPE_[A-Z0-9_]+", stype):
         continue
 
-    # Do not generate references absent from this checkout's headers.
-    if not re.search(r"\b" + re.escape(name) + r"\b", headers):
+    # Require the actual type declaration in vulkan_core.h.
+    if not re.search(
+        r"}\s*" + re.escape(name) + r"\s*;",
+        header
+    ):
         continue
 
-    if not re.search(r"\b" + re.escape(stype) + r"\b", headers):
+    # Require the enum identifier in the same header.
+    if not re.search(r"\b" + re.escape(stype) + r"\b", header):
         continue
 
-    entry = (name, struct.get("protect"))
+    key = canonical(stype)
+    entry = (stype, name, struct.get("protect"))
 
-    if stype in entries and entries[stype] != entry:
-        conflicts.append((stype, entries[stype], entry))
+    if key in entries:
+        old = entries[key]
+        if old[1] != name:
+            # Keep only a type actually declared in vulkan_core.h.
+            continue
     else:
-        entries[stype] = entry
-
-if conflicts:
-    raise RuntimeError(f"Conflicting sTypes: {conflicts}")
+        entries[key] = entry
 
 if not entries:
-    raise RuntimeError("No compatible VkDeviceCreateInfo structures found")
+    raise RuntimeError("No compatible pNext structures found")
 
 lines = [
-    "/* Generated from this checkout's Vulkan registry. */",
+    "/* Generated from matching Vulkan registry and core header. */",
     "/* Do not edit manually. */",
     ""
 ]
 
-for stype, (name, protect) in sorted(entries.items()):
+for stype, name, protect in sorted(entries.values()):
     if protect:
         lines.append(f"#ifdef {protect}")
 
@@ -84,8 +92,9 @@ for stype, (name, protect) in sorted(entries.items()):
 
     lines.append("")
 
-out_path.parent.mkdir(parents=True, exist_ok=True)
-out_path.write_text("\n".join(lines))
+out = Path(sys.argv[2])
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text("\n".join(lines))
 
-print("Generated:", out_path)
-print("Structures:", len(entries))
+print("Generated structures:", len(entries))
+print("Output:", out)

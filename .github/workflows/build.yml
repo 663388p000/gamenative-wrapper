@@ -43,7 +43,7 @@ jobs:
 
           echo "Using registry: $REGISTRY"
 
-          python3 generate_pnext_sizes.py \
+          python3 src/vulkan/wrapper/generate_pnext_sizes.py \ \
             "$REGISTRY" \
             src/vulkan/wrapper/wrapper_pnext_sizes.inc
 

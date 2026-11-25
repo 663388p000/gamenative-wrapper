@@ -1,3 +1,5 @@
+#include <stdalign.h>
+#include <stddef.h>
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -235,16 +237,26 @@ wrapper_add_env_extensions(const struct wrapper_physical_device *pdevice,
    free(list);
 }
 
-static void unlink_vk_struct(VkBaseInStructure *create_info, const VkBaseInStructure **current, VkBaseInStructure **prev) {
-   if (!*prev) 
-      create_info->pNext = (*current)->pNext;
-   else
-      (*prev)->pNext = (*current)->pNext;                                                
+static void unlink_vk_struct(const VkAllocationCallbacks *alloc,
+                             VkBaseInStructure *create_info,
+                             const VkBaseInStructure **current,
+                             VkBaseInStructure **prev)
+{
+   const VkBaseInStructure *removed = *current;
+   const VkBaseInStructure *next = removed->pNext;
 
-   *current = (*current)->pNext;
+   if (!*prev)
+      create_info->pNext = next;
+   else
+      (*prev)->pNext = next;
+
+   *current = next;
+   vk_free(alloc, (void *)removed);
 }
 
-static void process_pnext_chain(VkBaseInStructure *create_info, struct wrapper_physical_device *pdevice) {
+static void process_pnext_chain(const VkAllocationCallbacks *alloc,
+                                VkBaseInStructure *create_info,
+                                struct wrapper_physical_device *pdevice) {
    const uint32_t api_version = pdevice->properties2.properties.apiVersion;
    const VkBaseInStructure *current = (VkBaseInStructure *)create_info->pNext;
    VkBaseInStructure *prev = NULL;
@@ -261,42 +273,42 @@ static void process_pnext_chain(VkBaseInStructure *create_info, struct wrapper_p
              if (pdevice->base_supported_extensions.EXT_robustness2)
                 break;
              WRAPPER_LOG(info, "Unlinking VkPhysicalDeviceRobustness2FeaturesEXT from pNext chain");
-             unlink_vk_struct(create_info, &current, &prev);
+             unlink_vk_struct(alloc, create_info, &current, &prev);
              continue;
           case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT:
              if (pdevice->base_supported_extensions.EXT_dynamic_rendering_unused_attachments)
                 break;
              WRAPPER_LOG(info, "Unlinking VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT from pNext chain");
-             unlink_vk_struct(create_info, &current, &prev);
+             unlink_vk_struct(alloc, create_info, &current, &prev);
              continue;
           case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES:
              if (pdevice->base_supported_extensions.KHR_maintenance5)
                 break;
              WRAPPER_LOG(info, "Unlinking VkPhysicalDeviceMaintenance5Features from pNext chain");
-             unlink_vk_struct(create_info, &current, &prev);
+             unlink_vk_struct(alloc, create_info, &current, &prev);
              continue;
           case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT:
              if (pdevice->base_supported_extensions.EXT_vertex_attribute_divisor)
                 break;
              WRAPPER_LOG(info, "Unlinking VertexAttributeDivisorFeaturesEXT (driver lacks the EXT extension)");
-             unlink_vk_struct(create_info, &current, &prev);
+             unlink_vk_struct(alloc, create_info, &current, &prev);
              continue;
           case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES:
              if (api_version >= VK_MAKE_VERSION(1, 1, 0))
                 break;
              WRAPPER_LOG(info, "Unlinking VkPhysicalDeviceVulkan11Features from pNext chain");
-             unlink_vk_struct(create_info, &current, &prev);
+             unlink_vk_struct(alloc, create_info, &current, &prev);
              continue;
           case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
              if (api_version >= VK_MAKE_VERSION(1, 2, 0))
                 break;
              WRAPPER_LOG(info, "Unlinking VkPhysicalDeviceVulkan12Features from pNext chain");
-             unlink_vk_struct(create_info, &current, &prev);
+             unlink_vk_struct(alloc, create_info, &current, &prev);
              continue;
           case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: {
              if (api_version < VK_MAKE_VERSION(1, 3, 0)) {
                 WRAPPER_LOG(info, "Unlinking VkPhysicalDeviceVulkan13Features from pNext chain");
-                unlink_vk_struct(create_info, &current, &prev);
+                unlink_vk_struct(alloc, create_info, &current, &prev);
                 continue;
              }
              /*
@@ -829,6 +841,73 @@ wrapper_force_viewport_layer_features(VkDeviceCreateInfo *ci,
    ci->pNext = storage;
 }
 
+static size_t
+wrapper_device_create_info_pnext_size(VkStructureType sType)
+{
+   switch (sType) {
+#include "wrapper_pnext_sizes.inc"
+   default:
+      return 0;
+   }
+}
+
+static void
+wrapper_free_pnext_chain(const VkAllocationCallbacks *alloc,
+                         VkBaseOutStructure *chain)
+{
+   while (chain) {
+      VkBaseOutStructure *next = chain->pNext;
+      vk_free(alloc, chain);
+      chain = next;
+   }
+}
+
+static VkResult
+wrapper_clone_pnext_chain(const VkAllocationCallbacks *alloc,
+                          const void *source,
+                          void **destination)
+{
+   const VkBaseInStructure *src = source;
+   VkBaseOutStructure *head = NULL;
+   VkBaseOutStructure *tail = NULL;
+
+   *destination = NULL;
+
+   while (src) {
+      size_t size =
+         wrapper_device_create_info_pnext_size(src->sType);
+
+      if (!size) {
+         wrapper_free_pnext_chain(alloc, head);
+         return VK_ERROR_INITIALIZATION_FAILED;
+      }
+
+      VkBaseOutStructure *copy =
+         vk_alloc(alloc, size, alignof(max_align_t),
+                  VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+
+      if (!copy) {
+         wrapper_free_pnext_chain(alloc, head);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+
+      memcpy(copy, src, size);
+      copy->pNext = NULL;
+
+      if (tail)
+         tail->pNext = copy;
+      else
+         head = copy;
+
+      tail = copy;
+      src = src->pNext;
+   }
+
+   *destination = head;
+   return VK_SUCCESS;
+}
+
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
                      const VkDeviceCreateInfo* pCreateInfo,
@@ -850,6 +929,10 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    VkPhysicalDeviceFeatures2 *pdf2;
    VkPhysicalDeviceFeatures *pdf;
    VkResult result;
+   void *app_chain = NULL;
+   void *full_chain = NULL;
+   void *full_chain_allocated = NULL;
+   VkPhysicalDeviceFeatures *private_enabled_features = NULL;
    static int wrapper_safe_create_device = -1;
    static int wrapper_device_fault = -1;
    VkPhysicalDeviceFaultFeaturesEXT fault_features_ext = {
@@ -909,6 +992,41 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
       ((app_pdf && app_pdf->depthClamp) || (app_pdf2 && app_pdf2->features.depthClamp));
 
    /*
+    * Never modify the application's pNext chain or pEnabledFeatures.
+    * app_chain is the filtered application-only chain.
+    */
+   result = wrapper_clone_pnext_chain(&device->vk.alloc,
+                                      pCreateInfo->pNext,
+                                      &app_chain);
+   if (result != VK_SUCCESS) {
+      wrapper_DestroyDevice(wrapper_device_to_handle(device),
+                            &device->vk.alloc);
+      return vk_error(physical_device, result);
+   }
+
+   wrapper_create_info.pNext = app_chain;
+
+   if (pCreateInfo->pEnabledFeatures) {
+      private_enabled_features =
+         vk_alloc(&device->vk.alloc,
+                  sizeof(*private_enabled_features),
+                  alignof(max_align_t),
+                  VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+
+      if (!private_enabled_features) {
+         wrapper_free_pnext_chain(&device->vk.alloc, app_chain);
+         wrapper_DestroyDevice(wrapper_device_to_handle(device),
+                               &device->vk.alloc);
+         return vk_error(physical_device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+
+      memcpy(private_enabled_features, pCreateInfo->pEnabledFeatures,
+             sizeof(*private_enabled_features));
+
+      wrapper_create_info.pEnabledFeatures = private_enabled_features;
+   }
+
+   /*
     * Driver request list: the application's extensions (that the driver
     * lists) and nothing else, except the Valhall dynamic-rendering set, what
     * an emulated feature needs, and names the user asked for explicitly.
@@ -954,8 +1072,8 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    const struct vk_features *base = &physical_device->base_supported_features;
    const struct vk_features *app_enabled = &device->vk.enabled_features;
 
-   pdf = (void *)pCreateInfo->pEnabledFeatures;
-   pdf2 = __vk_find_struct((void *)pCreateInfo->pNext,
+   pdf = private_enabled_features;
+   pdf2 = __vk_find_struct((void *)app_chain,
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
 
 #define PATCH_FEATURE(f, v) do { \
@@ -995,11 +1113,28 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
 #undef STRIP_FEATURE
 #undef PATCH_FEATURE
 
-   process_pnext_chain((VkBaseInStructure *)&wrapper_create_info, device->physical);
+   process_pnext_chain(&device->vk.alloc,
+                       (VkBaseInStructure *)&wrapper_create_info,
+                       device->physical);
 
-   /* The chain as the application gave it (minus what the driver can't take,
-    * see above): what the second attempt below falls back to. */
-   const void *app_chain = wrapper_create_info.pNext;
+   /*
+    * Keep app_chain untouched by wrapper-forced feature additions.
+    * full_chain is the separate chain passed to the primary driver attempts.
+    */
+   result = wrapper_clone_pnext_chain(&device->vk.alloc,
+                                      app_chain,
+                                      &full_chain);
+   if (result != VK_SUCCESS) {
+      wrapper_feature_restore(feature_patches, n_feature_patches);
+      wrapper_free_pnext_chain(&device->vk.alloc, app_chain);
+      vk_free(&device->vk.alloc, private_enabled_features);
+      wrapper_DestroyDevice(wrapper_device_to_handle(device),
+                            &device->vk.alloc);
+      return vk_error(physical_device, result);
+   }
+
+   full_chain_allocated = full_chain;
+   wrapper_create_info.pNext = full_chain;
 
    /* These storage structs must stay alive through the driver
     * CreateDevice() call below, so they live in this stack frame rather
@@ -1059,8 +1194,9 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
       wrapper_safe_create_device = getenv("WRAPPER_SAFE_CREATE_DEVICE") ? atoi(getenv("WRAPPER_SAFE_CREATE_DEVICE")) : 1;
    }
 
-   /* The chain with everything the wrapper spliced in: attempts 1..n_wsi */
-   const void *full_chain = wrapper_create_info.pNext;
+   full_chain = wrapper_create_info.pNext;
+
+   /* full_chain contains all wrapper additions. */
 
    /* WSI extension tiers, heaviest first: [base+ahb] -> [base]; only when the
     * application presents (VK_KHR_swapchain). */
@@ -1144,6 +1280,16 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed driver createDevice, res %d", result);
       wrapper_emit_diag(physical_device, pCreateInfo, result);
+
+      wrapper_free_pnext_chain(&device->vk.alloc, full_chain_allocated);
+      wrapper_free_pnext_chain(&device->vk.alloc, app_chain);
+      vk_free(&device->vk.alloc, private_enabled_features);
+
+      full_chain_allocated = NULL;
+      full_chain = NULL;
+      app_chain = NULL;
+      private_enabled_features = NULL;
+
       wrapper_DestroyDevice(wrapper_device_to_handle(device),
                             &device->vk.alloc);
       return vk_error(physical_device, result);
@@ -1166,6 +1312,15 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
       wrapper_create_info_has_depth_clip(&wrapper_create_info);
    if (want_depth_clip && !device->emu_depth_clip)
       WRAPPER_LOG(info, "depthClamp emulation unavailable on this device (VK_EXT_depth_clip_enable not enabled)");
+
+   /* The driver has finished reading both private chains. */
+   wrapper_free_pnext_chain(&device->vk.alloc, full_chain_allocated);
+   wrapper_free_pnext_chain(&device->vk.alloc, app_chain);
+   vk_free(&device->vk.alloc, private_enabled_features);
+
+   full_chain = NULL;
+   app_chain = NULL;
+   private_enabled_features = NULL;
 
    void *gdpa = physical_device->instance->dispatch_table.GetInstanceProcAddr(
       physical_device->instance->dispatch_handle, "vkGetDeviceProcAddr");

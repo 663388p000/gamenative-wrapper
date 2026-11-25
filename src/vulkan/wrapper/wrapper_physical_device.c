@@ -336,6 +336,8 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          bool is_vkd3d = strstr(engine_name, "vkd3d");
          bool is_d3d = strstr(engine_name, "DXVK") || is_vkd3d;
          pdevice->is_vkd3d = is_vkd3d;
+      }
+
       list_addtail(&pdevice->vk.link, &_instance->physical_devices.list);
    }
 

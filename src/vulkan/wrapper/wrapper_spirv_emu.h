@@ -94,6 +94,14 @@ struct wrapper_spv_gs_params {
    uint32_t out_mode;           /* WSPV_GS_*; WIRE/POINTS need in_prim == 3     */
    uint32_t cull_location;      /* WSPV_GS_NO_CULL if there is nothing to cull  */
    uint32_t cull_count;
+
+   /* Features enabled on the logical device, not merely supported. */
+   bool shader_int16;
+   bool shader_int64;
+   bool shader_float16;
+   bool shader_float64;
+   bool storage_input_output16;
+
    bool forward_point_size;     /* the device can write PointSize from a GS     */
 };
 

@@ -37,7 +37,15 @@ enum : uint32_t {
 enum : uint32_t { DecBuiltIn = 11, DecLocation = 30 };
 enum : uint32_t { BiClipDistance = 3, BiCullDistance = 4, BiLayer = 9, BiViewportIndex = 10 };
 enum : uint32_t { StInput = 1, StOutput = 3 };
-enum : uint32_t { CapClipDistance = 32, CapCullDistance = 33 };
+enum : uint32_t {
+   CapFloat16 = 9,
+   CapFloat64 = 10,
+   CapInt64 = 11,
+   CapInt16 = 22,
+   CapClipDistance = 32,
+   CapCullDistance = 33,
+   CapStorageInputOutput16 = 4436,
+};
 
 struct Inst {
    uint32_t op = 0;
@@ -1242,54 +1250,92 @@ str_words(const char *s)
    return w;
 }
 
-/* interface types a pass-through geometry shader can copy: scalars, vectors,
- * matrices and arrays of those (no structs, no spec-constant array sizes) */
+/* Interface scalar types supported by the generated pass-through GS. */
 static bool
-gs_type_ok(const Module &m, uint32_t type, int depth = 0)
+gs_scalar_ok(const Module &m, uint32_t type,
+             const wrapper_spv_gs_params &p)
+{
+   const Inst *d = m.def(type);
+   if (!d)
+      return false;
+
+   if (d->op == OpTypeInt_) {
+      if (d->w.size() != 3 ||
+          (d->w[2] != 0 && d->w[2] != 1))
+         return false;
+
+      switch (d->w[1]) {
+      case 16:
+         return p.shader_int16 && p.storage_input_output16;
+      case 32:
+         return true;
+      case 64:
+         return p.shader_int64;
+      default:
+         return false;
+      }
+   }
+
+   if (d->op == OpTypeFloat_) {
+      if (d->w.size() != 2)
+         return false;
+
+      switch (d->w[1]) {
+      case 16:
+         return p.shader_float16 && p.storage_input_output16;
+      case 32:
+         return true;
+      case 64:
+         return p.shader_float64;
+      default:
+         return false;
+      }
+   }
+
+   return false;
+}
+
+static bool
+gs_type_ok(const Module &m, uint32_t type,
+           const wrapper_spv_gs_params &p, int depth = 0)
 {
    const Inst *d = m.def(type);
    uint32_t len;
 
    if (!d || depth > 4)
       return false;
+
    switch (d->op) {
    case OpTypeInt_:
-      return d->w.size() == 3 &&
-             d->w[1] == 32 &&
-             (d->w[2] == 0 || d->w[2] == 1);
    case OpTypeFloat_:
-      return d->w.size() == 2 && d->w[1] == 32;
-   case OpTypeVector_: {
-      if (d->w.size() != 3 || d->w[2] < 2 || d->w[2] > 4)
-         return false;
+      return gs_scalar_ok(m, type, p);
 
-      const Inst *component = m.def(d->w[1]);
-      return component &&
-             ((component->op == OpTypeInt_ && component->w.size() == 3 &&
-               component->w[1] == 32 &&
-               (component->w[2] == 0 || component->w[2] == 1)) ||
-              (component->op == OpTypeFloat_ && component->w.size() == 2 &&
-               component->w[1] == 32));
-   }
+   case OpTypeVector_:
+      return d->w.size() == 3 &&
+             d->w[2] >= 2 && d->w[2] <= 4 &&
+             gs_scalar_ok(m, d->w[1], p);
 
    case OpTypeMatrix_: {
-      if (d->w.size() != 3 || d->w[2] < 2 || d->w[2] > 4)
+      if (d->w.size() != 3 ||
+          d->w[2] < 2 || d->w[2] > 4)
          return false;
 
       const Inst *col = m.def(d->w[1]);
-      if (!col || col->op != OpTypeVector_ || col->w.size() != 3 ||
+      if (!col || col->op != OpTypeVector_ ||
+          col->w.size() != 3 ||
           col->w[2] < 2 || col->w[2] > 4)
          return false;
 
       const Inst *scalar = m.def(col->w[1]);
       return scalar && scalar->op == OpTypeFloat_ &&
-             scalar->w.size() == 2 && scalar->w[1] == 32;
+             gs_scalar_ok(m, col->w[1], p);
    }
 
    case OpTypeArray_:
       return d->w.size() == 3 &&
              m.const_u32(d->w[2], len) && len > 0 &&
-             gs_type_ok(m, d->w[1], depth + 1);
+             gs_type_ok(m, d->w[1], p, depth + 1);
+
    default:
       return false;
    }
@@ -1341,12 +1387,14 @@ struct GsGen {
 
       switch (d->op) {
       case OpTypeInt_:
-         if (d->w.size() != 3 || d->w[1] != 32 ||
+         if (d->w.size() != 3 ||
+             (d->w[1] != 16 && d->w[1] != 32 && d->w[1] != 64) ||
              (d->w[2] != 0 && d->w[2] != 1))
             return false;
          break;
       case OpTypeFloat_:
-         if (d->w.size() != 2 || d->w[1] != 32)
+         if (d->w.size() != 2 ||
+             (d->w[1] != 16 && d->w[1] != 32 && d->w[1] != 64))
             return false;
          break;
       case OpTypeVector_: {
@@ -1356,10 +1404,12 @@ struct GsGen {
          const Inst *component = vs.def(d->w[1]);
          if (!component ||
              !((component->op == OpTypeInt_ && component->w.size() == 3 &&
-                component->w[1] == 32 &&
+                (component->w[1] == 16 || component->w[1] == 32 ||
+                 component->w[1] == 64) &&
                 (component->w[2] == 0 || component->w[2] == 1)) ||
                (component->op == OpTypeFloat_ && component->w.size() == 2 &&
-                component->w[1] == 32)) ||
+                (component->w[1] == 16 || component->w[1] == 32 ||
+                 component->w[1] == 64))) ||
              !copy_type(d->w[1], depth + 1))
             return false;
          break;
@@ -1376,7 +1426,9 @@ struct GsGen {
 
          const Inst *scalar = vs.def(col->w[1]);
          if (!scalar || scalar->op != OpTypeFloat_ ||
-             scalar->w.size() != 2 || scalar->w[1] != 32 ||
+             scalar->w.size() != 2 ||
+             (scalar->w[1] != 16 && scalar->w[1] != 32 &&
+              scalar->w[1] != 64) ||
              !copy_type(d->w[1], depth + 1))
             return false;
          break;
@@ -1505,7 +1557,7 @@ gs_builtin_type_ok(const Module &m, uint32_t builtin, uint32_t type)
 }
 
 static bool
-gs_collect(const Module &m, const Entry &e, GsIface &g)
+gs_collect(const Module &m, const Entry &e, GsIface &g, const wrapper_spv_gs_params &p)
 {
    const Inst &ep = m.v[e.inst];
 
@@ -1552,7 +1604,7 @@ gs_collect(const Module &m, const Entry &e, GsIface &g)
          continue;
       }
 
-      if (!m.decor(vi.id, DecLocation, &loc) || !gs_type_ok(m, vi.pointee))
+      if (!m.decor(vi.id, DecLocation, &loc) || !gs_type_ok(m, vi.pointee, p))
          return false;
 
       GsUser u;
@@ -1616,7 +1668,7 @@ make_gs(const Module &vs, const char *entry, const wrapper_spv_gs_params &p,
       return false;
    if (p.out_mode != WSPV_GS_PASS && p.in_prim != 3)
       return false;
-   if (!vs.find_entry(WSPV_VERTEX, entry, e) || !gs_collect(vs, e, g))
+   if (!vs.find_entry(WSPV_VERTEX, entry, e) || !gs_collect(vs, e, g, p))
       return false;
 
    const uint32_t nverts = p.in_prim;                 /* vertices per input primitive */
@@ -1818,6 +1870,33 @@ make_gs(const Module &vs, const char *entry, const wrapper_spv_gs_params &p,
 
    mod.push_back(Inst(OpCapability_, {CapShader}));
    mod.push_back(Inst(OpCapability_, {CapGeometry}));
+
+   bool has_int16 = false;
+   bool has_float16 = false;
+   bool has_int64 = false;
+   bool has_float64 = false;
+
+   for (const Inst &in : gen.globals) {
+      if (in.op == OpTypeInt_ && in.w.size() == 3) {
+         has_int16 |= in.w[1] == 16;
+         has_int64 |= in.w[1] == 64;
+      } else if (in.op == OpTypeFloat_ && in.w.size() == 2) {
+         has_float16 |= in.w[1] == 16;
+         has_float64 |= in.w[1] == 64;
+      }
+   }
+
+   if (has_int16)
+      mod.push_back(Inst(OpCapability_, {CapInt16}));
+   if (has_float16)
+      mod.push_back(Inst(OpCapability_, {CapFloat16}));
+   if (has_int64)
+      mod.push_back(Inst(OpCapability_, {CapInt64}));
+   if (has_float64)
+      mod.push_back(Inst(OpCapability_, {CapFloat64}));
+   if (has_int16 || has_float16)
+      mod.push_back(Inst(OpCapability_, {CapStorageInputOutput16}));
+
    if (psize)
       mod.push_back(Inst(OpCapability_, {CapGeometryPointSize}));
    for (const Inst &in : vs.v)

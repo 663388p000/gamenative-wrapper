@@ -58,9 +58,9 @@ static struct vk_instance_extension_table *supported_instance_extensions;
 bool has_intercepted_layer_paths = false;
 
 #ifdef __LP64__
-#define DEFAULT_VULKAN_PATH "/system/lib64/libvulkan.so"
+#define DEFAULT_VULKAN_PATH "/vendor/lib64/hw/vulkan.mali.so"
 #else
-#define DEFAULT_VULKAN_PATH "/system/lib/libvulkan.so"
+#define DEFAULT_VULKAN_PATH "/vendor/lib/hw/vulkan.mali.so"
 #endif
 
 #include <dlfcn.h>

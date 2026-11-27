@@ -1119,6 +1119,14 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
                        device->physical);
 
    /*
+    * process_pnext_chain() unlinks and frees the structs the driver can not
+    * take. When that is the first struct of the chain only
+    * wrapper_create_info.pNext is updated, so app_chain would keep pointing at
+    * freed memory (cloned from, handed to the driver and freed again below).
+    */
+   app_chain = (void *)wrapper_create_info.pNext;
+
+   /*
     * Keep app_chain untouched by wrapper-forced feature additions.
     * full_chain is the separate chain passed to the primary driver attempts.
     */
@@ -1270,6 +1278,14 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    }
    create_stage = attempt + 1;
 
+   /* depthClamp emulation needs depth-clip control on the device that really
+    * got created (a fallback attempt may have dropped it). This has to be read
+    * before the feature patches are undone: when the application passed its own
+    * depth-clip struct, the wrapper turned depthClipEnable on in it for the
+    * driver call, and restoring it first would report the feature as off. */
+   device->emu_depth_clip = want_depth_clip &&
+      wrapper_create_info_has_depth_clip(&wrapper_create_info);
+
    /* the driver call is over: the application's feature structs are what they
     * were. A device made without the feature chain has no geometry shader. */
    wrapper_feature_restore(feature_patches, n_feature_patches);
@@ -1307,10 +1323,6 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    if (create_stage <= n_wsi && wsi_masks[create_stage - 1])
       WRAPPER_LOG(info, "WSI extension groups enabled on the driver device: 0x%x", wsi_masks[create_stage - 1]);
 
-   /* depthClamp emulation needs depth-clip control on the device that really
-    * got created (a fallback attempt may have dropped it). */
-   device->emu_depth_clip = want_depth_clip &&
-      wrapper_create_info_has_depth_clip(&wrapper_create_info);
    if (want_depth_clip && !device->emu_depth_clip)
       WRAPPER_LOG(info, "depthClamp emulation unavailable on this device (VK_EXT_depth_clip_enable not enabled)");
 

@@ -28,24 +28,24 @@ static struct wrapper_log wrapper_log_options[] = {
 
 uint64_t wrapper_log_mask;
 
-static void get_formatted_date_time(char *buf, size_t length) 
-{  
+static void get_formatted_date_time(char *buf, size_t length)
+{
    time_t rawtime = time(NULL);
-   struct tm *ptm = localtime(&rawtime);
+   struct tm tm_buf;
+   struct tm *ptm = localtime_r(&rawtime, &tm_buf);   /* logging is multi-threaded */
 
-   strftime(buf, 256, "%F_%H-%M-%S", ptm);
+   /* use the caller's buffer size, and never leave the buffer unset */
+   if (!ptm || !strftime(buf, length, "%F_%H-%M-%S", ptm))
+      snprintf(buf, length, "%lld", (long long)rawtime);
 }
 
 /* Name of the running executable (the part of /proc/self/cmdline after the
  * last '/' or '\'). Always returns a valid, NUL-terminated string. The result
  * is computed once and cached. */
-char *get_executable_name() {
-   static char name[PATH_MAX_SIZE];
-   static int resolved = 0;
+static char executable_name[PATH_MAX_SIZE];
 
-   if (resolved)
-      return name;
-
+static void resolve_executable_name(void) {
+   char *name = executable_name;
    char cmdline[PATH_MAX_SIZE] = { 0 };
    int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
 
@@ -64,9 +64,16 @@ char *get_executable_name() {
    if (ptr)
       base = ptr + 1;
 
-   snprintf(name, sizeof(name), "%s", base[0] ? base : "wrapper");
-   resolved = 1;
-   return name;
+   snprintf(name, sizeof(executable_name), "%s", base[0] ? base : "wrapper");
+}
+
+/* Called from several threads (log file, shader dumps, validation log): the
+ * name is resolved exactly once and is fully written before anyone reads it. */
+char *get_executable_name() {
+   static pthread_once_t once = PTHREAD_ONCE_INIT;
+
+   pthread_once(&once, resolve_executable_name);
+   return executable_name;
 }
 
 static unsigned long long get_debug_flag(const char *option) {
@@ -208,9 +215,14 @@ wrapper_debug_utils_messenger(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeve
                               void *userData)
 {
    static FILE *vvl_log_file = NULL;
+   static pthread_mutex_t vvl_lock = PTHREAD_MUTEX_INITIALIZER;
    const char* messageIdName = callbackData->pMessageIdName;
    int32_t messageIdNumber = callbackData->messageIdNumber;
    const char* message = callbackData->pMessage;
+
+   /* the validation layer calls this from any thread; without the lock two
+    * threads can both open the log file (and one handle is lost) */
+   pthread_mutex_lock(&vvl_lock);
 
    if (!vvl_log_file) {
        char date[256];
@@ -224,9 +236,12 @@ wrapper_debug_utils_messenger(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeve
    }
 
    if (vvl_log_file) {
-      fprintf(vvl_log_file, "[%s] Code %i : %s\n", messageIdName, messageIdNumber, message);
+      fprintf(vvl_log_file, "[%s] Code %i : %s\n", messageIdName ? messageIdName : "",
+              messageIdNumber, message ? message : "");
       fflush(vvl_log_file);
    }
+
+   pthread_mutex_unlock(&vvl_lock);
 
    return 0;
 }

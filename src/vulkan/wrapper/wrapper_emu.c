@@ -306,18 +306,28 @@ shader_lookup(struct wrapper_device *device, VkShaderModule module)
 }
 
 /* Vertex-stage facts about a registered module; "main" (what every compiler
- * of interest uses) is analysed once per module, anything else every time. */
+ * of interest uses) is analysed once per module, anything else every time.
+ *
+ * Pipelines are created from several threads at once and they can share a
+ * vertex shader, so the lazy fill happens under the shader mutex: without it a
+ * second thread can see vs_info_valid before the analysis result is visible
+ * to it (weak memory ordering on ARM64) or read it while it is being written. */
 static bool
-shader_vs_info(struct wrapper_emu_shader *s, const char *entry,
-               struct wrapper_spv_stage_info *out)
+shader_vs_info(struct wrapper_device *device, struct wrapper_emu_shader *s,
+               const char *entry, struct wrapper_spv_stage_info *out)
 {
    if (entry && !strcmp(entry, "main")) {
+      bool ok;
+
+      simple_mtx_lock(&device->shader_mutex);
       if (!s->vs_info_valid) {
          s->vs_info_ok = wrapper_spv_analyze(s->code, s->size, WSPV_VERTEX, "main", &s->vs_info);
          s->vs_info_valid = true;
       }
       *out = s->vs_info;
-      return s->vs_info_ok && out->found;
+      ok = s->vs_info_ok;
+      simple_mtx_unlock(&device->shader_mutex);
+      return ok && out->found;
    }
    return wrapper_spv_analyze(s->code, s->size, WSPV_VERTEX, entry, out) && out->found;
 }
@@ -587,7 +597,7 @@ rewrite_shaders(struct wrapper_device *device, struct wrapper_emu_rewrite *rw,
 
    vs_name = info->pStages[vs].pName;
    vss = shader_lookup(device, info->pStages[vs].module);
-   if (!vss || !shader_vs_info(vss, vs_name, &vi))
+   if (!vss || !shader_vs_info(device, vss, vs_name, &vi))
       return;
 
    if (info->pInputAssemblyState && !has_dynamic_state(info, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY)) {
@@ -673,7 +683,13 @@ rewrite_shaders(struct wrapper_device *device, struct wrapper_emu_rewrite *rw,
                                : WSPV_GS_PASS,
          .cull_location = WSPV_GS_NO_CULL,
          .cull_count = 0,
-         .forward_point_size = device->emu_gs_point_size,
+         .shader_int16 = device->vk.enabled_features.shaderInt16,
+ .shader_int64 = device->vk.enabled_features.shaderInt64,
+ .shader_float16 = device->vk.enabled_features.shaderFloat16,
+ .shader_float64 = device->vk.enabled_features.shaderFloat64,
+ .storage_input_output16 =
+    device->vk.enabled_features.storageInputOutput16,
+ .forward_point_size = device->emu_gs_point_size,
       };
       struct wrapper_spv_stage_info cur;
       const struct stage_code *gs_vs = &vsc;

@@ -396,6 +396,15 @@ struct Pending {
    Module &m;
    std::vector<Inst> list;
 
+   /*
+    * Declarations that an *existing* global variable is switched over to (the
+    * cloned gl_PerVertex struct and its pointer type). They have to be defined
+    * in front of that variable, so commit() places them right before it
+    * instead of with the rest of `list`.
+    */
+   std::vector<Inst> early;
+   uint32_t early_before = 0;
+
    explicit Pending(Module &mm) : m(mm) {}
 
    uint32_t find(uint32_t op, std::initializer_list<uint32_t> tail) const
@@ -532,43 +541,110 @@ struct Pending {
       return id;
    }
 
-   void commit()
+   bool commit()
    {
       std::vector<Inst> declarations;
       std::vector<Inst> variables;
 
-      /*
-       * Preserve dependency order between types and constants.
-       * Only global variables are moved to the end.
-       */
+      /* Keep the dependency order between the new types and constants. */
       for (Inst &in : list) {
          if (in.op == OpVariable_)
             variables.push_back(std::move(in));
          else
             declarations.push_back(std::move(in));
       }
+      list.clear();
 
-      /* New declarations must precede global variables that use them. */
-      size_t decl_at = m.first_function();
-      for (size_t i = 0; i < decl_at; i++) {
-         if (m.v[i].op == OpVariable_) {
-            decl_at = i;
-            break;
+      /*
+       * New types / constants / variables go behind every existing global
+       * declaration, i.e. right before the first function. Real modules
+       * interleave types, constants and variables (glslang emits the int type
+       * and its constants after the gl_PerVertex variable, for instance), so
+       * any earlier spot - such as "before the first variable" - can precede a
+       * type or constant that the new declaration refers to, and SPIR-V does
+       * not allow forward references in this section.
+       */
+      size_t at = m.first_function();
+      m.v.insert(m.v.begin() + at, declarations.begin(), declarations.end());
+      at += declarations.size();
+      m.v.insert(m.v.begin() + at, variables.begin(), variables.end());
+
+      /*
+       * What an existing variable now uses must be defined before that
+       * variable. Everything these declarations refer to (the member types of
+       * the original struct) is already defined in front of the variable.
+       */
+      if (!early.empty()) {
+         size_t var_at = m.v.size();
+         for (size_t i = 0; i < m.v.size(); i++) {
+            if (m.v[i].op == OpVariable_ && m.v[i].w.size() >= 2 &&
+                m.v[i].w[1] == early_before) {
+               var_at = i;
+               break;
+            }
          }
+         if (var_at == m.v.size()) {
+            early.clear();
+            m.index();
+            return false;
+         }
+         m.v.insert(m.v.begin() + var_at, early.begin(), early.end());
+         early.clear();
       }
 
-      m.v.insert(m.v.begin() + decl_at,
-                 declarations.begin(), declarations.end());
-
-      /* Global variables belong immediately before the first function. */
-      size_t var_at = m.first_function();
-      m.v.insert(m.v.begin() + var_at,
-                 variables.begin(), variables.end());
-
-      list.clear();
       m.index();
+      return true;
    }
 };
+
+/*
+ * Every type that a variable (global or function local) refers to, directly or
+ * through pointers, arrays, matrices, vectors and struct members. A type that
+ * is not in the result has no user that could observe its decorations.
+ */
+static std::unordered_set<uint32_t>
+live_types(const Module &m)
+{
+   enum : uint32_t { OpTypeRuntimeArray_ = 29 };
+   std::unordered_set<uint32_t> live;
+   std::vector<uint32_t> work;
+
+   for (const Inst &in : m.v)
+      if (in.op == OpVariable_ && !in.w.empty())
+         work.push_back(in.w[0]);
+
+   while (!work.empty()) {
+      const uint32_t id = work.back();
+      work.pop_back();
+      if (!live.insert(id).second)
+         continue;
+
+      const Inst *d = m.def(id);
+      if (!d)
+         continue;
+
+      switch (d->op) {
+      case OpTypePointer_:
+         if (d->w.size() >= 3)
+            work.push_back(d->w[2]);
+         break;
+      case OpTypeArray_:
+      case OpTypeRuntimeArray_:
+      case OpTypeVector_:
+      case OpTypeMatrix_:
+         if (d->w.size() >= 2)
+            work.push_back(d->w[1]);
+         break;
+      case OpTypeStruct_:
+         for (size_t i = 1; i < d->w.size(); i++)
+            work.push_back(d->w[i]);
+         break;
+      default:
+         break;
+      }
+   }
+   return live;
+}
 
 static bool
 emit(const Module &m, uint32_t **out, size_t *out_size_bytes)
@@ -965,14 +1041,14 @@ lower_builtin_vs(Module &m, const char *name, uint32_t builtin, uint32_t cap, ui
    cloned_struct.w[0] = NS;
    cloned_struct.w.erase(cloned_struct.w.begin() + 1 + k);
 
-   /* Keep all generated type declarations before generated constants. */
-   size_t type_at = 0;
-   while (type_at < P.list.size() && P.list[type_at].op != OpConstant_)
-      type_at++;
-
-   P.list.insert(P.list.begin() + type_at, std::move(cloned_struct));
-   P.list.insert(P.list.begin() + type_at + 1,
-                 Inst(OpTypePointer_, {PV, vi.storage, NS}));
+   /*
+    * V is switched over to the clone, so the clone and its pointer type have to
+    * be declared in front of V (see Pending::commit); all other generated
+    * declarations go behind the existing ones.
+    */
+   P.early.push_back(std::move(cloned_struct));
+   P.early.push_back(Inst(OpTypePointer_, {PV, vi.storage, NS}));
+   P.early_before = V;
 
    /* Redirect only V to the cloned struct pointer type. */
    bool found_var = false;
@@ -1031,7 +1107,8 @@ lower_builtin_vs(Module &m, const char *name, uint32_t builtin, uint32_t cap, ui
 
    if (m.id_exhausted)
       return false;
-   P.commit();
+   if (!P.commit())
+      return false;
 
    if (!m.find_entry(WSPV_VERTEX, name, e))
       return false;
@@ -1052,16 +1129,27 @@ lower_builtin_vs(Module &m, const char *name, uint32_t builtin, uint32_t cap, ui
          return false;
    }
 
-   /* V now uses the cloned struct; remove the stale BuiltIn annotation. */
-   for (size_t i = 0; i < m.v.size(); ) {
-      const Inst &in = m.v[i];
-      if (in.op == OpMemberDecorate_ && in.w.size() >= 4 &&
-          in.w[0] == S && in.w[1] == (uint32_t)k &&
-          in.w[2] == DecBuiltIn && in.w[3] == builtin) {
-         m.v.erase(m.v.begin() + i);
-         continue;
+   /*
+    * V now uses the cloned struct; remove the stale BuiltIn annotation. This
+    * covers S and also any struct that no variable uses any more, e.g. the
+    * original block left behind by an earlier lowering pass on the same module
+    * (clip distance first, cull distance second). Were such a decoration kept,
+    * the capability below could not be dropped, and the module would still
+    * need a capability the device does not have.
+    */
+   {
+      const std::unordered_set<uint32_t> live = live_types(m);
+
+      for (size_t i = 0; i < m.v.size(); ) {
+         const Inst &in = m.v[i];
+         if (in.op == OpMemberDecorate_ && in.w.size() >= 4 &&
+             in.w[2] == DecBuiltIn && in.w[3] == builtin &&
+             (in.w[0] == S || !live.count(in.w[0]))) {
+            m.v.erase(m.v.begin() + i);
+            continue;
+         }
+         i++;
       }
-      i++;
    }
 
    m.index();
@@ -1197,7 +1285,8 @@ lower_clip_fs_module(Module &m, const char *name, uint32_t count, uint32_t loc)
    m.index();
    if (m.id_exhausted)
       return false;
-   P.commit();
+   if (!P.commit())
+      return false;
 
    if (added_var) {
       m.v.insert(m.v.begin() + m.annotation_end(), Inst(OpDecorate_, {SV, DecLocation, loc}));

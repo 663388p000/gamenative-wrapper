@@ -23,7 +23,7 @@ parse_vk_version_from_env()
    const char *wrapper_vk_version = getenv("WRAPPER_VK_VERSION");
 
    if (wrapper_vk_version) {
-      sscanf(wrapper_vk_version, "%d.%d.%d", &major, &minor, &patch);
+      sscanf(wrapper_vk_version, "%u.%u.%u", &major, &minor, &patch);
       apiVersion = VK_MAKE_VERSION(major, minor, patch);
    }
 
@@ -275,10 +275,14 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
        * sees VK_ERROR_FEATURE_NOT_PRESENT instead of a device that renders wrong.
        */
       supported_features->presentId = true;
-      /* VK_EXT_map_memory_placed is not implemented by the wrapper any more */
-      supported_features->memoryMapPlaced = true;
-      supported_features->memoryMapRangePlaced = true;
-      supported_features->memoryUnmapReserve = true;
+      /*
+       * VK_EXT_map_memory_placed is not implemented by the wrapper any more
+       * (and is filtered out of the extension list, see wrapper_device.c), so
+       * memoryMapPlaced / memoryMapRangePlaced / memoryUnmapReserve are no
+       * longer forced on: they stay as the driver reports them. Forcing them on
+       * made an application that enables every feature it was told about hand
+       * the driver features it does not have.
+       */
 
       /* the driver is asked first (base_supported_features above); what it
        * lacks and the wrapper can build is built and reported (wrapper_emu.c) */
@@ -291,8 +295,10 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          supported_features->presentWait = supported_features->timelineSemaphore;
       }
       supported_features->swapchainMaintenance1 = true;
-      supported_features->imageCompressionControlSwapchain = true;
-      
+      /* imageCompressionControlSwapchain: VK_EXT_image_compression_control_swapchain
+       * is filtered out and not provided by the wrapper's WSI, so the feature is
+       * left as the driver reports it (it used to be forced on here). */
+
       /* WRAPPER_WSI_SW=1: present through shared memory / put-image instead of
        * AHardwareBuffer-backed images (slower, but needs nothing from the
        * driver's external memory) */
